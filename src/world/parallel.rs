@@ -1,6 +1,7 @@
 //! Parallel solving for disjoint coupled islands. Sequential ordering is
 //! preserved within each island and shared fixed endpoints are read-only.
-use super::{JointRow, PhysicsWorld, RigidBody, Row, effective_mass, solve};
+use super::solver::solve;
+use super::{JointRow, PhysicsWorld, RigidBody, Row, effective_mass};
 use crate::Vec3;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
