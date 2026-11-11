@@ -257,3 +257,96 @@ fn equal_mass_particle_pair_exchanges_normal_velocities() {
     assert_eq!(states[1].velocity, Vec3::X * 2.0);
     assert!((states[0].position.distance(states[1].position) - 0.3).abs() < 1e-12);
 }
+
+#[test]
+fn cloth_surface_self_collision_reaches_triangle_interior() {
+    use rust_physics::softbody::SelfCollision;
+    let mut body = SoftBody::default();
+    for p in [-Vec3::X - Vec3::Z, Vec3::X - Vec3::Z, Vec3::Z] {
+        body.push_node(p, 0.0).unwrap();
+    }
+    assert!(body.add_triangle([0, 1, 2]));
+    let i = body.push_node(Vec3::Y * 0.04, 1.0).unwrap();
+    let settings = SoftSettings {
+        gravity: Vec3::ZERO,
+        self_collision_distance: Some(0.1),
+        self_collision: SelfCollision::Surface,
+        ..Default::default()
+    };
+    assert!(body.step(1.0 / 60.0, settings, None));
+    assert!(body.position(i).unwrap().distance(Vec3::Y * 0.1) < 1e-12);
+}
+
+#[test]
+fn cloth_surface_self_collision_handles_crossing_interior_edges() {
+    use rust_physics::softbody::SelfCollision;
+    let mut body = SoftBody::default();
+    for p in [Vec3::X * -2.0, Vec3::X * 2.0, Vec3::Z * -2.0] {
+        body.push_node(p, 0.0).unwrap();
+    }
+    for p in [Vec3::Z * -3.0, Vec3::Z * 3.0, Vec3::new(3.0, 0.0, 3.0)] {
+        body.push_node(p + Vec3::Y * 0.04, 1.0).unwrap();
+    }
+    assert!(body.add_triangle([0, 1, 2]));
+    assert!(body.add_triangle([3, 4, 5]));
+    let settings = SoftSettings {
+        gravity: Vec3::ZERO,
+        self_collision_distance: Some(0.1),
+        self_collision: SelfCollision::Surface,
+        ..Default::default()
+    };
+    body.step(1.0 / 60.0, settings, None);
+    let middle = (body.position(3).unwrap() + body.position(4).unwrap()) * 0.5;
+    assert!(middle.y >= 0.1 - 1e-8);
+}
+
+#[test]
+fn coupled_soft_node_transfers_momentum_to_dynamic_collider() {
+    let mut world = PhysicsWorld::new();
+    world.set_gravity(Vec3::ZERO).unwrap();
+    let sphere = world.add_body(RigidBodyBuilder::dynamic().mass(3.0).build());
+    let mut soft = SoftBody::default();
+    let index = soft.push_node(Vec3::Y * 0.65, 1.0).unwrap();
+    let settings = SoftSettings {
+        gravity: -Vec3::Y * 20.0,
+        radius: 0.1,
+        damping: 0.0,
+        ..Default::default()
+    };
+    soft.step_coupled(0.1, settings, &mut world, QueryFilter::default());
+    let velocity = soft.velocity(index).unwrap();
+    let rigid = world.body(sphere).unwrap().velocity();
+    assert!(velocity.distance(rigid) < 1e-12);
+    assert!((velocity + rigid * 3.0).distance(-Vec3::Y * 2.0) < 1e-12);
+    assert!((soft.position(index).unwrap().y - 0.6).abs() < 1e-12);
+}
+
+#[test]
+fn color_field_surface_tension_pulls_symmetric_interface_inward() {
+    let mut fluid = Fluid::new(FluidSettings {
+        gravity: Vec3::ZERO,
+        viscosity: 0.0,
+        pressure_stiffness: 0.0,
+        surface_tension: 1.0,
+        ..Default::default()
+    })
+    .unwrap();
+    fluid.push(-Vec3::X * 0.1, Vec3::ZERO);
+    fluid.push(Vec3::X * 0.1, Vec3::ZERO);
+    fluid.step(0.001, None);
+    let [a, b] = [fluid.velocities()[0], fluid.velocities()[1]];
+    assert!(a.x > 0.0 && b.x < 0.0);
+    assert!((a + b).length() < 1e-12);
+}
+
+#[test]
+fn fluid_advance_returns_time_left_when_budget_is_exhausted() {
+    let mut fluid = Fluid::new(FluidSettings::default()).unwrap();
+    fluid.push(Vec3::ZERO, Vec3::ZERO);
+    let progress = fluid.advance(0.1, 2, None).unwrap();
+    assert_eq!(progress.substeps, 2);
+    assert!(progress.remaining > 0.0 && progress.remaining < 0.1);
+    let rest = fluid.advance(progress.remaining, 64, None).unwrap();
+    assert_eq!(rest.remaining, 0.0);
+    assert!((fluid.velocities()[0].y + 0.981).abs() < 1e-12);
+}

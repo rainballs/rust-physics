@@ -82,7 +82,12 @@ impl<T: SupportMap> SupportMap for Transformed<'_, T> {
 }
 
 /// Support-map view of any finite built-in rigid collider.
-pub struct PrimitiveSupport<'a>(&'a RigidBody);
+#[derive(Clone, Copy)]
+pub struct PrimitiveSupport<'a> {
+    shape: &'a Shape,
+    position: Vec3,
+    rotation: Quat,
+}
 
 impl<'a> PrimitiveSupport<'a> {
     pub fn new(body: &'a RigidBody) -> Option<Self> {
@@ -90,48 +95,96 @@ impl<'a> PrimitiveSupport<'a> {
             body.shape(),
             Shape::Plane | Shape::Mesh(_) | Shape::Compound(_)
         ))
-        .then_some(Self(body))
+        .then_some(Self {
+            shape: body.shape(),
+            position: body.position(),
+            rotation: body.rotation(),
+        })
+    }
+
+    pub(crate) fn at_pose(self, position: Vec3, rotation: Quat) -> Self {
+        Self {
+            position,
+            rotation,
+            ..self
+        }
+    }
+}
+
+impl PrimitiveSupport<'_> {
+    pub(crate) fn feature_center(&self, direction: Vec3) -> Vec3 {
+        self.support_point(direction, true)
+    }
+
+    fn support_point(&self, direction: Vec3, center: bool) -> Vec3 {
+        let d = self.rotation.conjugate() * direction;
+        let side = |v: f64| {
+            if center && v.abs() <= 1e-12 {
+                0.0
+            } else {
+                v.signum()
+            }
+        };
+        let p = match *self.shape {
+            Shape::Sphere { radius } => d * radius,
+            Shape::Capsule {
+                radius,
+                half_segment,
+            } => d * radius + Vec3::Y * (side(d.y) * half_segment),
+            Shape::Cuboid { half_extents } => {
+                Vec3::from_array(d.to_array().map(side)) * half_extents
+            }
+            Shape::Cylinder {
+                radius,
+                half_height,
+            } => {
+                let radial = Vec3::new(d.x, 0.0, d.z);
+                let radial = if center && radial.length_squared() <= 1e-24 {
+                    Vec3::ZERO
+                } else {
+                    radial.normalize_or_zero()
+                };
+                radial * radius + Vec3::Y * (side(d.y) * half_height)
+            }
+            Shape::Hull(ref hull) => {
+                let vertices = hull.surface().vertices();
+                let extreme = vertices
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.dot(d).total_cmp(&b.dot(d)))
+                    .expect("validated nonempty hull");
+                if center {
+                    let bounds = hull.surface().bounds();
+                    let tolerance = (bounds.max - bounds.min).max_element() * 1e-12;
+                    let maximum = extreme.dot(d);
+                    let (sum, count) = vertices
+                        .iter()
+                        .copied()
+                        .filter(|&p| maximum - p.dot(d) <= tolerance)
+                        .fold((Vec3::ZERO, 0), |(sum, count), p| (sum + p, count + 1));
+                    sum / f64::from(count)
+                } else {
+                    extreme
+                }
+            }
+            Shape::Plane | Shape::Mesh(_) | Shape::Compound(_) => {
+                unreachable!("validated convex collider")
+            }
+        };
+        self.position + self.rotation * p
     }
 }
 
 impl SupportMap for PrimitiveSupport<'_> {
     fn support(&self, direction: Vec3) -> Vec3 {
-        let b = self.0;
-        let d = b.rotation().conjugate() * direction;
-        let p = match b.shape {
-            Shape::Sphere { radius } => d * radius,
-            Shape::Capsule {
-                radius,
-                half_segment,
-            } => d * radius + Vec3::Y * (d.y.signum() * half_segment),
-            Shape::Cuboid { half_extents } => d.signum() * half_extents,
-            Shape::Cylinder {
-                radius,
-                half_height,
-            } => {
-                let radial = Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
-                radial * radius + Vec3::Y * (d.y.signum() * half_height)
-            }
-            Shape::Hull(ref hull) => hull
-                .surface()
-                .vertices()
-                .iter()
-                .copied()
-                .max_by(|a, b| a.dot(d).total_cmp(&b.dot(d)))
-                .expect("validated nonempty hull"),
-            Shape::Plane | Shape::Mesh(_) | Shape::Compound(_) => {
-                unreachable!("validated convex collider")
-            }
-        };
-        b.position() + b.rotation() * p
+        self.support_point(direction, false)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConvexContact {
     Separated,
-    /// The origin is within tolerance of the Minkowski boundary and no
-    /// enclosing tetrahedron was found.
+    /// The origin is in the tolerance band around the Minkowski boundary.
     Touching,
     Penetrating {
         /// Unit direction that separates B from A.
@@ -184,10 +237,14 @@ pub fn query(a: &impl SupportMap, b: &impl SupportMap, tolerance: f64) -> Convex
     let mut simplex = [Vertex::default(); 4];
     simplex[0] = first;
     let mut count = 1;
+    let mut last_projection = first.delta().dot(Vec3::X);
     for _ in 0..48 {
         let closest = closest_simplex(&simplex[..count]);
         let distance = closest.point.length();
         if distance <= tolerance {
+            if last_projection <= tolerance {
+                return Touching;
+            }
             let seed = if count == 4 && strictly_contains(simplex) {
                 Some(simplex)
             } else {
@@ -204,7 +261,8 @@ pub fn query(a: &impl SupportMap, b: &impl SupportMap, tolerance: f64) -> Convex
         let Some(next) = support(direction) else {
             return Indeterminate;
         };
-        if next.delta().dot(direction) < -tolerance {
+        last_projection = next.delta().dot(direction);
+        if last_projection < -tolerance {
             return Separated;
         }
 
@@ -326,6 +384,17 @@ fn seed_tetrahedron(
     } else {
         Vec3::AXES
     };
+    if simplex.len() >= 3
+        && let Some(normal) = (simplex[1].delta() - simplex[0].delta())
+            .cross(simplex[2].delta() - simplex[0].delta())
+            .try_normalize()
+    {
+        for direction in [normal, -normal] {
+            if support(direction)?.delta().dot(direction) <= tolerance {
+                return None;
+            }
+        }
+    }
     // Try complete tetrahedra as each new extreme point is discovered.
     for x in -1..=1 {
         for y in -1..=1 {
@@ -336,6 +405,9 @@ fn seed_tetrahedron(
                     continue;
                 };
                 let vertex = support(unit)?;
+                if vertex.delta().dot(unit) <= tolerance {
+                    return None;
+                }
                 if candidates
                     .iter()
                     .any(|p| p.delta().distance(vertex.delta()) <= tolerance * 0.01)
@@ -414,6 +486,33 @@ impl Face {
     }
 }
 
+const EPA_ITERATIONS: usize = 96;
+
+fn closed_horizon(edges: &[(usize, usize)], vertices: usize) -> bool {
+    if edges.len() < 3 {
+        return false;
+    }
+    let mut next = [usize::MAX; EPA_ITERATIONS + 4];
+    for &(a, b) in edges {
+        if a >= vertices || b >= vertices || next[a] != usize::MAX {
+            return false;
+        }
+        next[a] = b;
+    }
+    let origin = edges[0].0;
+    let mut current = origin;
+    for i in 0..edges.len() {
+        current = next[current];
+        if current == usize::MAX {
+            return false;
+        }
+        if current == origin {
+            return i + 1 == edges.len();
+        }
+    }
+    false
+}
+
 fn epa(
     seed: [Vertex; 4],
     support: impl Fn(Vec3) -> Option<Vertex>,
@@ -424,8 +523,11 @@ fn epa(
         .into_iter()
         .filter_map(|triangle| Face::new(&points, triangle))
         .collect();
+    if faces.len() != 4 {
+        return ConvexContact::Indeterminate;
+    }
     let mut border = Vec::new();
-    for _ in 0..96 {
+    for _ in 0..EPA_ITERATIONS {
         let Some(closest) = faces
             .iter()
             .copied()
@@ -461,16 +563,24 @@ fn epa(
             }
             false
         });
-        if border.is_empty() {
+        // A convex visible patch has exactly one oriented horizon. A
+        // triangulated convex hull with V vertices has at most 2V - 4
+        // faces. Reject degenerate topology before it can multiply faces.
+        let next = points.len();
+        if !closed_horizon(&border, next) || faces.len() + border.len() > 2 * (next + 1) - 4 {
             break;
         }
-        let next = points.len();
         points.push(vertex);
-        faces.extend(
-            border
-                .iter()
-                .filter_map(|&(a, b)| Face::new(&points, [a, b, next])),
-        );
+        for &(a, b) in &border {
+            let vertices = [a, b, next];
+            let Some(face) = Face::new(&points, vertices) else {
+                return ConvexContact::Indeterminate;
+            };
+            if face.vertices != vertices {
+                return ConvexContact::Indeterminate;
+            }
+            faces.push(face);
+        }
     }
     ConvexContact::Indeterminate
 }
@@ -617,4 +727,19 @@ pub(crate) fn cast_translation(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::closed_horizon;
+
+    #[test]
+    fn horizon_requires_one_closed_cycle_without_duplicate_outgoing_edges() {
+        assert!(closed_horizon(&[(2, 0), (0, 1), (1, 2)], 3));
+        assert!(!closed_horizon(&[(0, 1), (0, 2), (2, 0)], 3));
+        assert!(!closed_horizon(
+            &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)],
+            6
+        ));
+    }
 }

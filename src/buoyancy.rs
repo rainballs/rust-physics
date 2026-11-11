@@ -40,7 +40,7 @@ impl BuoyancyPlane {
             return None;
         }
         let body = world.body(handle)?;
-        if body.kind() != BodyKind::Dynamic || body.is_sensor() {
+        if body.kind() != BodyKind::Dynamic || body.is_sensor() || !body.is_enabled() {
             return None;
         }
         let Shape::Sphere { radius } = *body.shape() else {

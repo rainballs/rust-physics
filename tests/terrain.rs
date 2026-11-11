@@ -191,3 +191,25 @@ fn convex_capsule_cast_hits_static_heightfield() {
     assert!((hit.distance - 2.25).abs() < 2e-6, "{hit:?}");
     assert!(hit.normal.distance(Vec3::Y) < 1e-5);
 }
+
+#[test]
+fn welded_flat_seam_does_not_create_swept_edge_bounce() {
+    let mesh = Arc::new(TriangleMesh::heightfield([2, 2], [10.0, 10.0], &[0.0; 4]).unwrap());
+    let mut w = PhysicsWorld::new();
+    w.set_gravity(Vec3::ZERO).unwrap();
+    w.add_body(
+        RigidBodyBuilder::static_body()
+            .shape(Shape::Mesh(mesh))
+            .build(),
+    );
+    let id = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(Vec3::new(1.0, 0.49, 5.0))
+            .velocity(Vec3::X * 600.0)
+            .ccd(true)
+            .build(),
+    );
+    let stats = w.step_fixed().unwrap();
+    assert_eq!(stats.ccd_impacts, 0);
+    assert!((w.body(id).unwrap().velocity().x - 600.0).abs() < 1e-9);
+}

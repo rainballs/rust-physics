@@ -122,6 +122,40 @@ fn main() {
         });
     }
 
+    #[cfg(feature = "rayon")]
+    for parallel_islands in [false, true] {
+        use rust_physics::Shape;
+        let mut world = PhysicsWorld::new();
+        world
+            .set_settings(Settings {
+                parallel_islands,
+                sleep_time: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+        world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+        for x in 0..128 {
+            for y in 0..8 {
+                world.add_body(
+                    RigidBodyBuilder::dynamic()
+                        .shape(Shape::cuboid(Vec3::splat(0.4)))
+                        .position(Vec3::new(f64::from(x) * 2.0, 0.4 + f64::from(y) * 0.8, 0.0))
+                        .build(),
+                );
+            }
+        }
+        let label = if parallel_islands {
+            "parallel stacked islands"
+        } else {
+            "serial stacked islands"
+        };
+        measure(label, 1_024, || {
+            let stats = world.step_fixed().unwrap();
+            assert_eq!(stats.solved_parallel_islands > 0, parallel_islands);
+            black_box(stats);
+        });
+    }
+
     for n in [10_000, 100_000, 1_000_000] {
         let mut aos = vec![
             Particle {

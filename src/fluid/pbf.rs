@@ -211,15 +211,15 @@ impl PbfFluid {
     }
 
     fn smooth_velocities(&mut self) {
-        let coefficient = self.settings.viscosity * self.poly6 * self.settings.particle_mass
-            / self.settings.rest_density;
+        let coefficient = self.settings.viscosity * self.poly6 * self.settings.particle_mass;
         if coefficient == 0.0 {
             return;
         }
         self.deltas.fill(Vec3::ZERO);
         for &(i, j) in &self.pairs {
             let gap = self.radius_squared - self.positions[i].distance_squared(self.positions[j]);
-            let change = (self.velocities[j] - self.velocities[i]) * (coefficient * gap.powi(3));
+            let weight = coefficient * gap.powi(3) / self.densities[i].max(self.densities[j]);
+            let change = (self.velocities[j] - self.velocities[i]) * weight;
             self.deltas[i] += change;
             self.deltas[j] -= change;
         }

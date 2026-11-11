@@ -9,7 +9,8 @@ A Cargo workspace contains one library crate. Module boundaries keep shape geome
 | `collision`, `spatial` | Narrow-phase contact generation, AABBs, shape projections, casts, and flat BVH |
 | `convex`, `hull` | Experimental GJK/EPA, support maps, and indexed convex hull mass properties |
 | `compound`, `terrain` | Child colliders, static triangle BVHs, and heightfield triangulation |
-| `character`, `vehicle`, `buoyancy` | Swept kinematic sphere motion, raycast suspension, and spherical-cap buoyancy |
+| `collider`, `motion` | Collider handles and experimental convex sweeps |
+| `character`, `vehicle`, `buoyancy`, `fields` | Swept kinematic sphere motion, raycast suspension, spherical-cap buoyancy, and environmental force fields |
 | `world`, `joints` | Handles, dense storage, broad phase, solver rows, warm starts, sleeping, events, and queries |
 | `grid`, `dynamic_tree` | Neighbor hashing, uniform-grid broad phase, and persistent fat-AABB tree |
 | `particles`, `softbody`, `fluid` | Particle storage, XPBD, and experimental SPH and PBF |
@@ -19,15 +20,15 @@ A Cargo workspace contains one library crate. Module boundaries keep shape geome
 
 1. Accumulate gravity, forces and torque into velocities and world-space angular momentum. Apply exponential damping.
 2. Prepare and warm-start joint rows, then iterate them before pose integration. This avoids advancing through constraint motion that the current impulses can already resolve.
-3. Advance poses. Opted-in spheres sweep against filtered static targets, solve impacts, and advance the remaining time up to four impacts per sphere. Optional synchronized CCD sweeps against translating spheres and advances the world through up to 32 impact events. Budget exhaustion completes the remaining time discretely and increments a statistic.
+3. Advance poses. Opted-in spheres sweep against filtered static targets, solve impacts, and advance the remaining time up to four impacts per sphere. Experimental convex CCD advances a frozen angular-velocity path against static targets. Optional synchronized CCD sweeps against translating spheres and advances the world through up to 32 impact events. Budget exhaustion completes the remaining time discretely and increments a statistic.
 4. Build finite AABB candidates with sweep-and-prune, a median-split BVH, a persistent tree, or a uniform grid. Test planes separately. Sort candidate pairs by handle before serial or optional Rayon narrow-phase contact generation.
 5. Find dynamic contact islands, wake connected bodies as needed, and prepare contact rows using local-anchor impulse matching.
-6. Warm-start contacts, solve independent manifolds locally to convergence, and interleave coupled joint and contact rows. Joint rows retain their pre-advance Jacobians for this pass. Iteratively translate bodies in coupled manifolds to reduce residual penetration without changing velocities.
-7. Update island sleep timers and publish begin/end transitions for substep overlaps. Swept impacts are also available as an independently recorded, time-ordered sequence.
+6. Warm-start contacts, solve independent manifolds locally to convergence, and interleave coupled joint and contact rows. The optional Rayon path solves disjoint coupled islands from separate working state and publishes momenta after the workers finish. Joint rows retain their pre-advance Jacobians for this pass. Iteratively translate bodies in coupled manifolds to reduce residual penetration without changing velocities.
+7. Evaluate joint break thresholds, update island sleep timers, and publish begin/end transitions for substep overlaps. Swept impacts are also available as an independently recorded, time-ordered sequence.
 8. On the final substep, retain sampled debug contacts. Clear external force and torque after the public step.
 
-Bodies live in a dense vector and a handle-to-index map. World-scoped serial IDs are never reused. Removal swap-compacts storage, updates the moved index, and removes linked joints. Sorted flat buffers retain contact manifolds, events, and impulses across substeps, minimizing per-contact allocations. Public mutable body access invalidates that body's cached impulses.
+Bodies live in a dense vector and a handle-to-index map. World-scoped serial IDs are never reused. Removal swap-compacts storage, updates the moved index, and removes linked joints. Sorted flat buffers retain contact manifolds, events, and impulses across substeps, minimizing per-contact allocations. Public mutable body access invalidates that body's cached impulses and sampled contact geometry. Unchanged sleeping contacts can reuse their geometry. Checkpoints capture active solver caches and events for deterministic replay.
 
 Candidate order, contact order, and joint order are stable for an identical construction and input sequence on the same build and machine. A fixed timestep helps reproducibility. Floating-point results across targets, compilers, or different insertion histories may differ.
 
-Spatial queries can scan dense storage or borrow a BVH snapshot that prohibits world mutation during reuse. Particle-based solvers optionally borrow the rigid world for boundary projections. SPH can optionally exchange normal impulses with dynamic rigid boundaries.
+Spatial queries can scan dense storage or borrow a BVH snapshot that prohibits world mutation during reuse. Particle-based solvers optionally borrow the rigid world for boundary projections. SPH, particles, and deformable nodes can optionally exchange normal impulses with dynamic rigid boundaries.

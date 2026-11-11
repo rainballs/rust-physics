@@ -693,6 +693,11 @@ fn rounded_points(a: Vec3, b: Vec3, ar: f64, br: f64, fallback: Vec3, out: &mut 
 
 /// Closest pair on two finite segments, including zero-length segments.
 fn closest_segments(a: Vec3, u: Vec3, b: Vec3, v: Vec3) -> (Vec3, Vec3) {
+    let (s, t) = closest_segment_parameters(a, u, b, v);
+    (a + s * u, b + t * v)
+}
+
+pub(crate) fn closest_segment_parameters(a: Vec3, u: Vec3, b: Vec3, v: Vec3) -> (f64, f64) {
     let w = a - b;
     let uu = u.length_squared();
     let vv = v.length_squared();
@@ -715,7 +720,7 @@ fn closest_segments(a: Vec3, u: Vec3, b: Vec3, v: Vec3) -> (Vec3, Vec3) {
     } else {
         0.0
     };
-    (a + s * u, b + t * v)
+    (s, t)
 }
 
 fn box_capsule(cube: &RigidBody, h: Vec3, capsule: &RigidBody, out: &mut Vec<Contact>) {

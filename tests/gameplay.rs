@@ -102,3 +102,55 @@ fn sphere_buoyancy_matches_hemisphere_volume_and_centroid() {
     w.step_fixed().unwrap();
     assert!(w.body(body).unwrap().position().length() < 1e-12);
 }
+
+#[test]
+fn quadratic_drag_uses_projected_area_and_relative_wind() {
+    use rust_physics::fields::Atmosphere;
+    let mut w = PhysicsWorld::new();
+    w.set_gravity(Vec3::ZERO).unwrap();
+    let id = w.add_body(RigidBodyBuilder::dynamic().velocity(Vec3::X * 12.0).build());
+    let atmosphere = Atmosphere {
+        density: 1.2,
+        drag_coefficient: 0.47,
+        wind: Vec3::X * 2.0,
+    };
+    let force = atmosphere.apply(&mut w, id).unwrap();
+    let expected = -0.5 * 1.2 * 0.47 * std::f64::consts::PI * 0.25 * 100.0;
+    assert!(force.distance(Vec3::X * expected) < 1e-12);
+    w.step_fixed().unwrap();
+    assert!((w.body(id).unwrap().velocity().x - (12.0 + expected / 60.0)).abs() < 1e-12);
+}
+
+#[test]
+fn mutual_gravity_preserves_momentum_and_tracks_two_body_orbit() {
+    use rust_physics::fields::MutualGravity;
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        gravity: Vec3::ZERO,
+        substeps: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let bodies = [-1.0, 1.0].map(|side| {
+        w.add_body(
+            RigidBodyBuilder::dynamic()
+                .position(Vec3::X * side)
+                .velocity(Vec3::Y * (0.5 * side))
+                .shape(Shape::sphere(0.1))
+                .build(),
+        )
+    });
+    let field = MutualGravity {
+        gravitational_constant: 1.0,
+        softening: 0.0,
+    };
+    let dt = 1.0 / 240.0;
+    for _ in 0..3_016 {
+        field.apply(&mut w, &bodies).unwrap();
+        w.step(dt).unwrap();
+        let [a, b] = bodies.map(|id| w.body(id).unwrap());
+        assert!((a.velocity() + b.velocity()).length() < 1e-11);
+        assert!((a.position().distance(b.position()) - 2.0).abs() < 0.004);
+    }
+    assert!(w.body(bodies[0]).unwrap().position().distance(-Vec3::X) < 0.006);
+}

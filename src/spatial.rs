@@ -1,5 +1,5 @@
 //! Bounding boxes and ray intersection primitives.
-use crate::convex::{self, PrimitiveSupport, SupportMap};
+use crate::convex::{self, PrimitiveSupport};
 use crate::{RigidBody, Shape, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -807,7 +807,7 @@ pub(crate) fn cast_convex_body(
     }
     if target.shape == Shape::Plane {
         let normal = target.rotation * Vec3::Y;
-        let closest = support.support(-normal);
+        let closest = support.feature_center(-normal);
         let gap = (closest - target.position).dot(normal);
         if gap <= 0.0 {
             return Some((0.0, normal, closest - normal * gap));
@@ -893,6 +893,9 @@ impl<'a> SpatialIndex<'a> {
         let mut proxies = Vec::with_capacity(bodies.len());
         let mut planes = Vec::new();
         for (index, &(_, body)) in bodies.iter().enumerate() {
+            if !body.is_enabled() {
+                continue;
+            }
             if let Some(bounds) = Aabb::of(body) {
                 proxies.push(Proxy { index, bounds });
             } else {

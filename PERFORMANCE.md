@@ -76,3 +76,16 @@ Reusing exact neighbor pairs reduced the 4,096-particle SPH median from 6.01 to 
 The scaling benchmark reached 170,536 KiB peak RSS and the throughput benchmark reached 202,392 KiB. These are process-level Linux child resource peaks. The throughput program holds all three particle layouts simultaneously at its largest size. Per-step allocator activity and hardware cache misses were not instrumented.
 
 The release soak ran 192 seeds and 691,200 fixed steps with 48 mixed rigid bodies per seed, repeated removal and insertion, impulses, CCD, and all four broad phases. It recorded 137,882,267 contact points and 7,826 swept impacts in 174.81 seconds. The soak checked finite state, normalized contacts and orientations, and bounded poses. It is a stability check rather than an isolated throughput benchmark.
+
+## Later solver, allocation, and phase measurements
+
+Four-worker coupled island solving reduced the median fixed step for 128 independent eight-box stacks from 13.64 ms to 5.09 ms. Sleeping was disabled, the boxes used two substeps and twelve velocity iterations, and the same scenes ran in both configurations. A separate parallel dispatch experiment on 100,000 independent floor contacts was slower at 40.09 ms versus 37.04 ms serial. Independent manifolds therefore remain serial in the implementation.
+
+```sh
+cargo bench --bench allocations
+cargo run --release --example profile -- 100000
+```
+
+The allocation benchmark observed zero allocations and reallocations in twenty warmed-up serial steps at 1,000, 10,000, and 100,000 bodies for its separated and floor-contact scenarios. The initial implementation made one temporary geometry allocation per substep. This measurement excludes changes to world topology, temporary convex EPA work, and parallel worker buffers.
+
+A profiled 100,000-contact run recorded 37.84 ms total median. Per-phase medians were 2.80 ms for forces and initial joint solving, 2.04 ms for poses and CCD, 4.84 ms for broad phase, 2.87 ms for narrow phase, 24.43 ms for solver preparation and solving, and 0.38 ms for sleeping and event publication. Per-phase medians need not sum to the median total.

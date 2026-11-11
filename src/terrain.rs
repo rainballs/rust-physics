@@ -2,13 +2,22 @@
 use crate::convex::{self, PrimitiveSupport, TriangleSupport};
 use crate::spatial::{Aabb, Bvh, Proxy, ray_capsule};
 use crate::{RigidBody, Vec3};
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub struct TriangleMesh {
     vertices: Box<[Vec3]>,
     triangles: Box<[[usize; 3]]>,
+    normals: Box<[Vec3]>,
+    active_edges: Box<[[bool; 3]]>,
     bvh: Bvh,
     bounds: Aabb,
+}
+
+struct EdgeUse {
+    triangle: usize,
+    edge: usize,
+    opposite: usize,
 }
 
 impl PartialEq for TriangleMesh {
@@ -29,12 +38,25 @@ impl TriangleMesh {
         if vertices.iter().any(|p| !p.is_finite()) || triangles.is_empty() {
             return None;
         }
+        let mut normals = Vec::with_capacity(triangles.len());
+        let mut neighbors = BTreeMap::<_, Vec<EdgeUse>>::new();
         let mut proxies = Vec::with_capacity(triangles.len());
-        for (index, &[a, b, c]) in triangles.iter().enumerate() {
-            let [a, b, c] = [*vertices.get(a)?, *vertices.get(b)?, *vertices.get(c)?];
+        for (index, &[i, j, k]) in triangles.iter().enumerate() {
+            let [a, b, c] = [*vertices.get(i)?, *vertices.get(j)?, *vertices.get(k)?];
             let normal = (b - a).cross(c - a).try_normalize()?;
             if !normal.is_finite() {
                 return None;
+            }
+            normals.push(normal);
+            for (edge, (u, v, w)) in [(i, j, k), (j, k, i), (k, i, j)].into_iter().enumerate() {
+                neighbors
+                    .entry((u.min(v), u.max(v)))
+                    .or_default()
+                    .push(EdgeUse {
+                        triangle: index,
+                        edge,
+                        opposite: w,
+                    });
             }
             proxies.push(Proxy {
                 index,
@@ -44,12 +66,29 @@ impl TriangleMesh {
                 },
             });
         }
+        let mut active_edges = vec![[true; 3]; triangles.len()];
+        for ((u, v), linked) in neighbors {
+            let [a, b] = linked.as_slice() else {
+                continue;
+            };
+            let n = normals[a.triangle];
+            let edge = vertices[v] - vertices[u];
+            let side = |w| edge.cross(vertices[w] - vertices[u]).dot(n);
+            if n.dot(normals[b.triangle]).abs() > 1.0 - 1e-10
+                && side(a.opposite).signum() != side(b.opposite).signum()
+            {
+                active_edges[a.triangle][a.edge] = false;
+                active_edges[b.triangle][b.edge] = false;
+            }
+        }
         let bounds = proxies.iter().map(|p| p.bounds).reduce(Aabb::union)?;
         let mut bvh = Bvh::default();
         bvh.rebuild(&mut proxies);
         Some(Self {
             vertices,
             triangles,
+            normals: normals.into_boxed_slice(),
+            active_edges: active_edges.into_boxed_slice(),
             bvh,
             bounds,
         })
@@ -104,11 +143,9 @@ impl TriangleMesh {
             .bvh
             .nearest(point, |i| {
                 let triangle = self.triangle(i);
-                let surface = closest_triangle(point, triangle);
+                let surface = closest_feature(point, triangle, self.normals[i]).0;
                 let delta = point - surface;
-                let normal = delta
-                    .try_normalize()
-                    .unwrap_or_else(|| triangle_normal(triangle));
+                let normal = delta.try_normalize().unwrap_or(self.normals[i]);
                 (delta.length_squared(), (surface, normal))
             })
             .expect("validated nonempty mesh");
@@ -152,13 +189,20 @@ impl TriangleMesh {
             |triangle| triangle.intersects(bounds),
             |index| {
                 let triangle = self.triangle(index);
-                let closest = closest_triangle(center, triangle);
+                let (closest, feature) = closest_feature(center, triangle, self.normals[index]);
+                if let Some((edge, t)) = feature {
+                    let active = self.active_edges[index];
+                    if !active[edge]
+                        && !(t == 0.0 && active[(edge + 2) % 3])
+                        && !(t == 1.0 && active[(edge + 1) % 3])
+                    {
+                        return;
+                    }
+                }
                 let delta = center - closest;
                 let depth = radius - delta.length();
                 if depth >= 0.0 {
-                    let normal = delta
-                        .try_normalize()
-                        .unwrap_or_else(|| triangle_normal(triangle));
+                    let normal = delta.try_normalize().unwrap_or(self.normals[index]);
                     emit(closest, normal, depth);
                 }
             },
@@ -209,8 +253,14 @@ impl TriangleMesh {
         self.bvh.visit(
             |bounds| bounds.expanded(radius).hit_ray(origin, direction, max),
             |index| {
-                if let Some((t, n)) = cast_triangle(origin, direction, radius, self.triangle(index))
-                    && t <= max
+                if let Some((t, n)) = cast_triangle(
+                    origin,
+                    direction,
+                    radius,
+                    self.triangle(index),
+                    self.normals[index],
+                    self.active_edges[index],
+                ) && t <= max
                     && best
                         .is_none_or(|(distance, i, _)| t < distance || (t == distance && index < i))
                 {
@@ -233,23 +283,32 @@ pub(crate) fn inside_triangle(p: Vec3, [a, b, c]: [Vec3; 3], n: Vec3) -> bool {
 }
 
 pub(crate) fn closest_triangle(point: Vec3, triangle: [Vec3; 3]) -> Vec3 {
-    let [a, b, c] = triangle;
-    let normal = triangle_normal(triangle);
+    closest_feature(point, triangle, triangle_normal(triangle)).0
+}
+
+fn closest_feature(
+    point: Vec3,
+    triangle @ [a, b, c]: [Vec3; 3],
+    normal: Vec3,
+) -> (Vec3, Option<(usize, f64)>) {
     let projected = point - normal * (point - a).dot(normal);
     if inside_triangle(projected, triangle, normal) {
-        return projected;
+        return (projected, None);
     }
-    [(a, b), (b, c), (c, a)]
+    let (nearest, edge, t) = [(a, b), (b, c), (c, a)]
         .into_iter()
-        .map(|(a, b)| {
+        .enumerate()
+        .map(|(i, (a, b))| {
             let edge = b - a;
-            a + edge * ((point - a).dot(edge) / edge.length_squared()).clamp(0.0, 1.0)
+            let t = ((point - a).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
+            (a + edge * t, i, t)
         })
-        .min_by(|a, b| {
+        .min_by(|(a, _, _), (b, _, _)| {
             a.distance_squared(point)
                 .total_cmp(&b.distance_squared(point))
         })
-        .expect("three edges")
+        .expect("three edges");
+    (nearest, Some((edge, t)))
 }
 
 fn ray_triangle(origin: Vec3, direction: Vec3, triangle: [Vec3; 3]) -> Option<(f64, Vec3)> {
@@ -268,13 +327,14 @@ fn cast_triangle(
     direction: Vec3,
     radius: f64,
     triangle: [Vec3; 3],
+    normal: Vec3,
+    active_edges: [bool; 3],
 ) -> Option<(f64, Vec3)> {
-    let start_distance = origin.distance(closest_triangle(origin, triangle));
+    let start_distance = origin.distance(closest_feature(origin, triangle, normal).0);
     if start_distance < radius * (1.0 - 1e-8) {
         return None;
     }
 
-    let normal = triangle_normal(triangle);
     let denominator = normal.dot(direction);
     let mut best = None;
     if denominator != 0.0 {
@@ -287,7 +347,10 @@ fn cast_triangle(
         }
     }
     let [a, b, c] = triangle;
-    for (start, end) in [(a, b), (b, c), (c, a)] {
+    for ((start, end), active) in [(a, b), (b, c), (c, a)].into_iter().zip(active_edges) {
+        if !active {
+            continue;
+        }
         let edge = end - start;
         let length = edge.length();
         let u = edge / length;

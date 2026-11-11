@@ -398,3 +398,223 @@ fn origin_rebase_keeps_relative_geometry_velocities_and_handles() {
     }
     assert!((world.body(id).unwrap().position().y - 0.5).abs() < 0.003);
 }
+
+#[test]
+fn convex_ccd_detects_translating_box_and_rotating_tip() {
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        gravity: Vec3::ZERO,
+        ccd_convex: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let floor = w.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    let moving = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::cuboid(Vec3::new(0.2, 0.1, 0.3)))
+            .position(Vec3::Y * 3.0)
+            .velocity(-Vec3::Y * 700.0)
+            .ccd(true)
+            .build(),
+    );
+    let rotating = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::cuboid(Vec3::new(1.0, 0.05, 0.1)))
+            .position(Vec3::new(5.0, 0.75, 0.0))
+            .angular_velocity(Vec3::Z * 120.0)
+            .ccd(true)
+            .build(),
+    );
+    let stats = w.step_fixed().unwrap();
+    assert!(stats.ccd_impacts >= 2);
+    assert!(w.ccd_impacts().iter().any(|hit| hit.moving == moving
+        && hit.target == floor
+        && (hit.time - (3.0 - 0.1) / 700.0).abs() < 1e-7));
+    assert!(
+        w.ccd_impacts()
+            .iter()
+            .any(|hit| hit.moving == rotating && hit.target == floor && hit.time > 0.0)
+    );
+    let b = w.body(rotating).unwrap();
+    assert!(b.position().y > 0.75);
+    assert!(b.angular_velocity().z < 120.0);
+}
+
+#[test]
+fn flat_box_ccd_uses_contact_feature_center_without_spurious_spin() {
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        gravity: Vec3::ZERO,
+        ccd_convex: true,
+        ..Default::default()
+    })
+    .unwrap();
+    floor(&mut w);
+    let id = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::cuboid(Vec3::new(0.5, 0.1, 0.5)))
+            .position(Vec3::Y * 2.0)
+            .velocity(-Vec3::Y * 300.0)
+            .material(Material {
+                restitution: 1.0,
+                ..Default::default()
+            })
+            .ccd(true)
+            .build(),
+    );
+    let stats = w.step_fixed().unwrap();
+    assert_eq!(stats.ccd_impacts, 1);
+    let b = w.body(id).unwrap();
+    assert!(b.velocity().distance(Vec3::Y * 300.0) < 1e-10);
+    assert_eq!(b.angular_velocity(), Vec3::ZERO);
+}
+
+#[test]
+#[cfg(feature = "rayon")]
+fn parallel_coupled_islands_match_serial_state() {
+    let build = |parallel_islands| {
+        let mut w = PhysicsWorld::new();
+        w.set_settings(rust_physics::Settings {
+            parallel_islands,
+            sleep_time: 0.0,
+            ..Default::default()
+        })
+        .unwrap();
+        floor(&mut w);
+        for x in 0..64 {
+            for y in 0..6 {
+                w.add_body(
+                    RigidBodyBuilder::dynamic()
+                        .shape(Shape::cuboid(Vec3::splat(0.4)))
+                        .position(Vec3::new(f64::from(x) * 2.0, 0.4 + f64::from(y) * 0.8, 0.0))
+                        .build(),
+                );
+            }
+        }
+        w
+    };
+    let (mut a, mut b) = (build(false), build(true));
+    let mut parallel_work = 0;
+    for _ in 0..40 {
+        a.step_fixed().unwrap();
+        parallel_work += b.step_fixed().unwrap().solved_parallel_islands;
+        for ((_, a), (_, b)) in a.bodies().zip(b.bodies()) {
+            assert_eq!(
+                (
+                    a.position(),
+                    a.rotation(),
+                    a.velocity(),
+                    a.angular_momentum()
+                ),
+                (
+                    b.position(),
+                    b.rotation(),
+                    b.velocity(),
+                    b.angular_momentum()
+                )
+            );
+        }
+    }
+    assert!(parallel_work > 0);
+}
+
+#[test]
+fn profiled_step_has_same_physics_and_accounts_for_phases() {
+    let mut a = PhysicsWorld::new();
+    let mut b = PhysicsWorld::new();
+    for world in [&mut a, &mut b] {
+        floor(world);
+        world.add_body(RigidBodyBuilder::dynamic().position(Vec3::Y * 0.5).build());
+    }
+    let plain = a.step_fixed().unwrap();
+    let profile = b.step_fixed_profiled().unwrap();
+    assert_eq!(plain.contact_points, profile.stats.contact_points);
+    for ((_, a), (_, b)) in a.bodies().zip(b.bodies()) {
+        assert_eq!((a.position(), a.velocity()), (b.position(), b.velocity()));
+    }
+    let t = profile.timings;
+    assert!(
+        t.total
+            >= t.forces_and_joints
+                + t.pose_and_ccd
+                + t.broad_phase
+                + t.narrow_phase
+                + t.solver
+                + t.sleep_and_events
+    );
+}
+
+#[test]
+fn deactivated_body_is_paused_excluded_and_reusable() {
+    let mut world = PhysicsWorld::new();
+    world.set_gravity(Vec3::ZERO).unwrap();
+    world.add_body(RigidBodyBuilder::static_body().sensor(true).build());
+    let body = world.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(Vec3::X * 0.1)
+            .velocity(Vec3::Y)
+            .build(),
+    );
+    world.step_fixed().unwrap();
+    assert!(world.events().iter().any(|e| e.started && e.b == body));
+    let position = world.body(body).unwrap().position();
+    assert!(world.set_enabled(body, false));
+    assert!(!world.apply_impulse(body, Vec3::X, position));
+    world.step_fixed().unwrap();
+    assert!(world.events().iter().any(|e| !e.started && e.b == body));
+    let filter = QueryFilter {
+        include_sensors: false,
+        ..Default::default()
+    };
+    assert!(
+        world
+            .raycast(Vec3::Y * 2.0, -Vec3::Y, 4.0, filter)
+            .is_none()
+    );
+    assert_eq!(world.body(body).unwrap().position(), position);
+    assert!(world.set_enabled(body, true));
+    world.step_fixed().unwrap();
+    assert!(world.body(body).unwrap().position().y > position.y);
+    assert!(world.events().iter().any(|e| e.started && e.b == body));
+}
+
+#[test]
+fn torque_free_angular_acceleration_matches_local_velocity_change() {
+    let mut world = PhysicsWorld::new();
+    let id = world.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::cuboid(Vec3::new(0.5, 1.0, 1.5)))
+            .angular_velocity(Vec3::new(1.0, -2.0, 0.7))
+            .build(),
+    );
+    let b = world.body(id).unwrap();
+    let initial = b.angular_velocity();
+    let acceleration = b.acceleration(world.settings().gravity).angular;
+    let dt = 1e-7;
+    world.step(dt).unwrap();
+    let derivative = (world.body(id).unwrap().angular_velocity() - initial) / dt;
+    assert!(
+        derivative.distance(acceleration) < 1e-6,
+        "{derivative:?} {acceleration:?}"
+    );
+}
+
+#[test]
+fn sleeping_manifold_reuse_invalidates_when_support_moves() {
+    let mut world = PhysicsWorld::new();
+    let support = world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    let sphere = world.add_body(RigidBodyBuilder::dynamic().position(Vec3::Y * 0.5).build());
+    for _ in 0..120 {
+        world.step_fixed().unwrap();
+    }
+    assert!(world.body(sphere).unwrap().is_sleeping());
+    assert!(world.step_fixed().unwrap().reused_sleeping_manifolds > 0);
+    world
+        .body_mut(support)
+        .unwrap()
+        .set_pose(Vec3::Y * 0.2, Quat::IDENTITY);
+    let stats = world.step_fixed().unwrap();
+    assert_eq!(stats.reused_sleeping_manifolds, 0);
+    assert!(!world.body(sphere).unwrap().is_sleeping());
+    assert!(world.body(sphere).unwrap().position().y > 0.6);
+}

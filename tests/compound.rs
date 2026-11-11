@@ -112,3 +112,36 @@ fn fracture_inherits_velocity_field_and_preserves_momenta_and_energy() {
     assert!(l.distance(initial_l) < 1e-11);
     assert!((e - initial_e).abs() < 1e-11);
 }
+
+#[test]
+fn child_collider_handles_resolve_pose_and_expire_when_geometry_is_replaced() {
+    let geometry = Arc::new(Compound::new(vec![part(-Vec3::X, 1.0), part(Vec3::X, 1.0)]).unwrap());
+    let mut world = PhysicsWorld::new();
+    let body = world.add_body(
+        RigidBodyBuilder::static_body()
+            .position(Vec3::Y * 2.0)
+            .shape(Shape::Compound(geometry))
+            .build(),
+    );
+    let handles: Vec<_> = world.colliders(body).collect();
+    assert_eq!(handles.len(), 3);
+    let hit = world
+        .raycast_collider(
+            Vec3::new(1.0, 4.0, 0.0),
+            -Vec3::Y,
+            5.0,
+            QueryFilter::default(),
+        )
+        .unwrap();
+    assert_eq!(hit.collider, handles[2]);
+    let child = world.collider(hit.collider).unwrap();
+    assert_eq!(child.position, Vec3::new(1.0, 2.0, 0.0));
+    assert_eq!(child.shape, &Shape::sphere(0.25));
+    *world.body_mut(body).unwrap() = RigidBodyBuilder::static_body().build();
+    assert!(handles.iter().all(|&id| world.collider(id).is_none()));
+    assert!(
+        world
+            .collider(world.colliders(body).next().unwrap())
+            .is_some()
+    );
+}

@@ -22,35 +22,28 @@ impl Method {
             position: x,
             velocity: v,
         } = state;
-        let a = acceleration(x);
+        let initial = || acceleration(x);
         match self {
             Self::Euler => State {
                 position: x + dt * v,
-                velocity: v + dt * a,
+                velocity: v + dt * initial(),
             },
-            Self::SemiImplicitEuler => State {
-                position: x + dt * (v + dt * a),
-                velocity: v + dt * a,
-            },
+            Self::SemiImplicitEuler => {
+                let velocity = v + dt * initial();
+                State {
+                    position: x + dt * velocity,
+                    velocity,
+                }
+            }
             Self::VelocityVerlet => {
+                let a = initial();
                 let position = x + dt * (v + 0.5 * dt * a);
                 State {
                     position,
                     velocity: v + 0.5 * dt * (a + acceleration(position)),
                 }
             }
-            Self::RungeKutta4 => {
-                let v2 = v + 0.5 * dt * a;
-                let a2 = acceleration(x + 0.5 * dt * v);
-                let v3 = v + 0.5 * dt * a2;
-                let a3 = acceleration(x + 0.5 * dt * v2);
-                let v4 = v + dt * a3;
-                let a4 = acceleration(x + dt * v3);
-                State {
-                    position: x + (dt / 6.0) * (v + 2.0 * (v2 + v3) + v4),
-                    velocity: v + (dt / 6.0) * (a + 2.0 * (a2 + a3) + a4),
-                }
-            }
+            Self::RungeKutta4 => rk4(state, 0.0, dt, |_, sample| acceleration(sample.position)),
         }
     }
 }
@@ -171,4 +164,78 @@ pub fn adaptive_rk4(
         accepted,
         rejected,
     })
+}
+
+/// Two-position Verlet integrator for a fixed step and position-dependent force.
+#[derive(Clone, Copy, Debug)]
+pub struct PositionVerlet {
+    previous: Vec3,
+    current: Vec3,
+    dt: f64,
+}
+
+impl PositionVerlet {
+    /// Initializes the previous position using the local acceleration.
+    pub fn new(state: State, dt: f64, acceleration: Vec3) -> Option<Self> {
+        if !dt.is_finite()
+            || dt <= 0.0
+            || !state.position.is_finite()
+            || !state.velocity.is_finite()
+            || !acceleration.is_finite()
+        {
+            return None;
+        }
+        let previous = state.position - state.velocity * dt + acceleration * (0.5 * dt * dt);
+        previous.is_finite().then_some(Self {
+            previous,
+            current: state.position,
+            dt,
+        })
+    }
+
+    pub fn position(&self) -> Vec3 {
+        self.current
+    }
+
+    /// Advances one step and returns the centered velocity at the pose
+    /// immediately before the advance.
+    pub fn advance(&mut self, acceleration: impl Fn(Vec3) -> Vec3) -> Option<Vec3> {
+        let next = self.current
+            + (self.current - self.previous)
+            + acceleration(self.current) * (self.dt * self.dt);
+        let velocity = (next - self.previous) / (2.0 * self.dt);
+        if !next.is_finite() || !velocity.is_finite() {
+            return None;
+        }
+        self.previous = self.current;
+        self.current = next;
+        Some(velocity)
+    }
+}
+
+/// Classical RK4 for time-, position-, and velocity-dependent acceleration.
+pub fn rk4(state: State, time: f64, dt: f64, acceleration: impl Fn(f64, State) -> Vec3) -> State {
+    let a1 = acceleration(time, state);
+    let half = 0.5 * dt;
+    let second = State {
+        position: state.position + state.velocity * half,
+        velocity: state.velocity + a1 * half,
+    };
+    let a2 = acceleration(time + half, second);
+    let third = State {
+        position: state.position + second.velocity * half,
+        velocity: state.velocity + a2 * half,
+    };
+    let a3 = acceleration(time + half, third);
+    let fourth = State {
+        position: state.position + third.velocity * dt,
+        velocity: state.velocity + a3 * dt,
+    };
+    let a4 = acceleration(time + dt, fourth);
+    State {
+        position: state.position
+            + (state.velocity + (second.velocity + third.velocity) * 2.0 + fourth.velocity)
+                * (dt / 6.0),
+        velocity: state.velocity + (a1 + (a2 + a3) * 2.0 + a4) * (dt / 6.0),
+    }
 }

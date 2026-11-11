@@ -4,6 +4,9 @@ use crate::hull::RigidHull;
 use crate::terrain::TriangleMesh;
 use crate::{Mat3, Quat, Vec3};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GEOMETRY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
@@ -132,6 +135,8 @@ impl Default for Material {
 #[derive(Clone, Debug)]
 pub struct RigidBody {
     pub(crate) kind: BodyKind,
+    pub(crate) geometry_id: u64,
+    pub(crate) geometry_dirty: bool,
     pub(crate) shape: Shape,
     pub(crate) position: Vec3,
     pub(crate) rotation: Quat,
@@ -155,7 +160,15 @@ pub struct RigidBody {
     pub(crate) sensor: bool,
     pub(crate) sleep_time: f64,
     pub(crate) asleep: bool,
+    pub(crate) enabled: bool,
     pub(crate) ccd: bool,
+}
+
+/// Instantaneous acceleration from the current external loads and damping.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Acceleration {
+    pub linear: Vec3,
+    pub angular: Vec3,
 }
 
 impl RigidBody {
@@ -190,6 +203,34 @@ impl RigidBody {
         self.layer
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+    pub fn material(&self) -> Material {
+        self.material
+    }
+    pub fn collision_mask(&self) -> u32 {
+        self.mask
+    }
+
+    /// Returns external acceleration before contact and joint impulses.
+    pub fn acceleration(&self, gravity: Vec3) -> Acceleration {
+        if self.kind != BodyKind::Dynamic || !self.enabled || self.asleep {
+            return Acceleration::default();
+        }
+        let rotation = Mat3::from_quat(self.rotation);
+        let omega = self.angular_velocity();
+        let full_momentum = rotation * (self.inertia * (rotation.transpose() * omega));
+        Acceleration {
+            linear: gravity * self.gravity_scale * self.linear_axes
+                + self.apply_inverse_mass(self.force)
+                - self.velocity * self.damping[0],
+            angular: self.apply_inverse_inertia(
+                self.torque - omega.cross(full_momentum) - self.angular_momentum * self.damping[1],
+            ),
+        }
+    }
+
     pub fn angular_velocity(&self) -> Vec3 {
         match self.kind {
             BodyKind::Static => Vec3::ZERO,
@@ -215,7 +256,11 @@ impl RigidBody {
     }
 
     pub(crate) fn apply_inverse_mass(&self, impulse: Vec3) -> Vec3 {
-        (impulse * self.linear_axes) * self.inverse_mass
+        if self.linear_axes == Vec3::ONE {
+            impulse * self.inverse_mass
+        } else {
+            (impulse * self.linear_axes) * self.inverse_mass
+        }
     }
 
     fn refresh_constrained_inertia(&mut self) {
@@ -247,6 +292,7 @@ impl RigidBody {
         }
         self.position = position;
         self.rotation = rotation / length;
+        self.geometry_dirty = true;
         self.refresh_constrained_inertia();
         self.wake();
         true
@@ -282,7 +328,11 @@ impl RigidBody {
     }
 
     pub fn add_force_at_point(&mut self, force: Vec3, point: Vec3) -> bool {
-        if self.kind != BodyKind::Dynamic || !force.is_finite() || !point.is_finite() {
+        if self.kind != BodyKind::Dynamic
+            || !self.enabled
+            || !force.is_finite()
+            || !point.is_finite()
+        {
             return false;
         }
         let accumulated_force = self.force + force;
@@ -298,7 +348,7 @@ impl RigidBody {
 
     pub fn add_torque(&mut self, torque: Vec3) -> bool {
         let accumulated = self.torque + torque;
-        if self.kind != BodyKind::Dynamic || !accumulated.is_finite() {
+        if self.kind != BodyKind::Dynamic || !self.enabled || !accumulated.is_finite() {
             return false;
         }
         self.torque = accumulated;
@@ -307,7 +357,11 @@ impl RigidBody {
     }
 
     pub fn apply_impulse(&mut self, impulse: Vec3, point: Vec3) -> bool {
-        if self.kind != BodyKind::Dynamic || !impulse.is_finite() || !point.is_finite() {
+        if self.kind != BodyKind::Dynamic
+            || !self.enabled
+            || !impulse.is_finite()
+            || !point.is_finite()
+        {
             return false;
         }
         let velocity = self.velocity + self.apply_inverse_mass(impulse);
@@ -323,7 +377,7 @@ impl RigidBody {
     }
 
     pub(crate) fn solver_impulse(&mut self, impulse: Vec3, offset: Vec3) {
-        if self.inverse_mass > 0.0 && !self.asleep {
+        if self.inverse_mass > 0.0 && !self.asleep && self.enabled {
             self.velocity += self.apply_inverse_mass(impulse);
             self.angular_momentum += offset.cross(impulse) * self.angular_axes;
         }
@@ -343,12 +397,24 @@ impl RigidBody {
         }
     }
 
+    /// Pose along the frozen angular-velocity path used by convex CCD.
+    pub(crate) fn integrate_swept_pose(&mut self, dt: f64) {
+        let spin = self.angular_velocity();
+        self.geometry_dirty |= dt != 0.0 && (self.velocity != Vec3::ZERO || spin != Vec3::ZERO);
+        self.position += self.velocity * dt;
+        if spin != Vec3::ZERO {
+            self.rotation = (Quat::from_scaled_axis(spin * dt) * self.rotation).normalize();
+            self.refresh_constrained_inertia();
+        }
+    }
+
     pub(crate) fn integrate_pose(&mut self, dt: f64) {
-        if self.kind == BodyKind::Static || self.asleep {
+        if self.kind == BodyKind::Static || self.asleep || !self.enabled {
             return;
         }
         self.position += self.velocity * dt;
         let spin = self.angular_velocity();
+        self.geometry_dirty |= dt != 0.0 && (self.velocity != Vec3::ZERO || spin != Vec3::ZERO);
         if spin == Vec3::ZERO {
             return;
         }
@@ -385,6 +451,8 @@ impl RigidBodyBuilder {
         Self {
             body: RigidBody {
                 kind,
+                geometry_id: 0,
+                geometry_dirty: true,
                 shape: Shape::sphere(0.5),
                 position: Vec3::ZERO,
                 rotation: Quat::IDENTITY,
@@ -408,6 +476,7 @@ impl RigidBodyBuilder {
                 sensor: false,
                 sleep_time: 0.0,
                 asleep: false,
+                enabled: true,
                 ccd: false,
             },
             mass: 1.0,
@@ -569,6 +638,9 @@ impl RigidBodyBuilder {
         if !b.angular_momentum.is_finite() || !b.constrained_inverse_inertia.is_finite() {
             return Err(InvalidBody);
         }
+        b.geometry_id = NEXT_GEOMETRY
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("collider identifiers exhausted");
         Ok(b)
     }
 

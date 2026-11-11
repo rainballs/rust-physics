@@ -1,8 +1,18 @@
 //! Extended position-based cloth and tetrahedral volume constraints.
 use crate::grid::SpatialHash;
-use crate::particles::project_boundaries;
+use crate::particles::{boundary_targets, coupled_boundary, project_boundaries};
 use crate::{PhysicsWorld, QueryFilter, Vec3};
 use std::collections::BTreeSet;
+
+mod surface;
+use surface::SurfaceContacts;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelfCollision {
+    #[default]
+    Nodes,
+    Surface,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
@@ -36,6 +46,7 @@ pub struct SoftSettings {
     pub radius: f64,
     /// Optional minimum separation for non-adjacent node pairs.
     pub self_collision_distance: Option<f64>,
+    pub self_collision: SelfCollision,
 }
 
 impl Default for SoftSettings {
@@ -46,6 +57,7 @@ impl Default for SoftSettings {
             damping: 0.15,
             radius: 0.02,
             self_collision_distance: None,
+            self_collision: SelfCollision::Nodes,
         }
     }
 }
@@ -57,6 +69,7 @@ pub struct SoftBody {
     triangles: Vec<[usize; 3]>,
     adjacent: BTreeSet<(usize, usize)>,
     self_collision: Option<NodeBroadPhase>,
+    surface_contacts: SurfaceContacts,
 }
 
 struct NodeBroadPhase {
@@ -108,12 +121,37 @@ impl SoftBody {
         self.nodes.get(index).map(|node| node.position)
     }
 
+    pub fn velocity(&self, index: usize) -> Option<Vec3> {
+        self.nodes.get(index).map(|node| node.velocity)
+    }
+
     pub fn positions(&self) -> impl ExactSizeIterator<Item = Vec3> + '_ {
         self.nodes.iter().map(|node| node.position)
     }
 
     pub fn triangles(&self) -> &[[usize; 3]] {
         &self.triangles
+    }
+
+    /// Adds a triangle to the deformable surface. Triangle edges are excluded
+    /// from self-contact. Mechanical constraints can be added separately.
+    pub fn add_triangle(&mut self, indices: [usize; 3]) -> bool {
+        if !self.valid(indices, 0.0) {
+            return false;
+        }
+        let [a, b, c] = indices.map(|i| self.nodes[i].position);
+        if (b - a).cross(c - a).try_normalize().is_none() {
+            return false;
+        }
+        for (a, b) in [
+            (indices[0], indices[1]),
+            (indices[1], indices[2]),
+            (indices[2], indices[0]),
+        ] {
+            self.adjacent.insert(ordered(a, b));
+        }
+        self.triangles.push(indices);
+        true
     }
 
     /// Sets a pinned point's position and zeroes its velocity.
@@ -229,13 +267,43 @@ impl SoftBody {
                     if !cloth.add_distance([i + 1, i + width], compliance) {
                         return None;
                     }
-                    cloth
-                        .triangles
-                        .extend([[i, i + width, i + 1], [i + 1, i + width, i + width + 1]]);
+                    if !cloth.add_triangle([i, i + width, i + 1])
+                        || !cloth.add_triangle([i + 1, i + width, i + width + 1])
+                    {
+                        return None;
+                    }
                 }
             }
         }
         Some(cloth)
+    }
+
+    /// Advances XPBD, then exchanges normal impulses between movable nodes
+    /// and rigid boundaries. Boundary projection occurs after internal XPBD
+    /// constraints, and the caller advances the rigid world separately.
+    pub fn step_coupled(
+        &mut self,
+        dt: f64,
+        settings: SoftSettings,
+        world: &mut PhysicsWorld,
+        filter: QueryFilter,
+    ) -> bool {
+        if !self.step(dt, settings, None) {
+            return false;
+        }
+        let targets = boundary_targets(world, filter);
+        for node in self.nodes.iter_mut().filter(|n| n.inverse_mass > 0.0) {
+            coupled_boundary(
+                &mut node.position,
+                &mut node.velocity,
+                settings.radius,
+                0.0,
+                node.inverse_mass,
+                world,
+                &targets,
+            );
+        }
+        true
     }
 
     /// Advances one XPBD step. Optional rigid colliders constrain node positions.
@@ -263,6 +331,7 @@ impl SoftBody {
             return false;
         }
         if let Some(spacing) = settings.self_collision_distance
+            && settings.self_collision == SelfCollision::Nodes
             && self
                 .self_collision
                 .as_ref()
@@ -293,10 +362,20 @@ impl SoftBody {
             for constraint in &mut self.constraints {
                 constraint.solve(&mut self.nodes, dt_squared);
             }
-            if settings.self_collision_distance.is_some()
-                && let Some(grid) = &mut self.self_collision
-            {
-                grid.solve(&mut self.nodes, &self.adjacent);
+            if let Some(thickness) = settings.self_collision_distance {
+                match settings.self_collision {
+                    SelfCollision::Nodes => self
+                        .self_collision
+                        .as_mut()
+                        .expect("initialized node grid")
+                        .solve(&mut self.nodes, &self.adjacent),
+                    SelfCollision::Surface => self.surface_contacts.solve(
+                        &mut self.nodes,
+                        &self.triangles,
+                        &self.adjacent,
+                        thickness,
+                    ),
+                }
             }
             if let Some((world, filter)) = boundary {
                 for node in self.nodes.iter_mut().filter(|n| n.inverse_mass > 0.0) {

@@ -14,6 +14,14 @@ pub struct Joint {
     pub kind: JointKind,
     /// Fraction of position error corrected per substep for rigid rows.
     pub stabilization: f64,
+    pub break_limit: Option<JointBreakLimit>,
+}
+
+/// Maximum solved linear force and intrinsic angular torque before a joint breaks.
+#[derive(Clone, Copy, Debug)]
+pub struct JointBreakLimit {
+    pub force: Option<f64>,
+    pub torque: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +99,22 @@ impl Joint {
             anchors,
             kind,
             stabilization: 0.2,
+            break_limit: None,
+        }
+    }
+
+    pub fn breakable(mut self, limit: JointBreakLimit) -> Self {
+        self.break_limit = Some(limit);
+        self
+    }
+
+    pub(crate) fn requires_awake(self) -> bool {
+        match self.kind {
+            JointKind::Revolute { motor, .. } | JointKind::Prismatic { motor, .. } => {
+                motor.is_some_and(|motor| motor.speed != 0.0 && motor.max_effort > 0.0)
+            }
+            JointKind::Spring { .. } => true,
+            _ => false,
         }
     }
 
@@ -101,6 +125,9 @@ impl Joint {
         self.bodies[0] != self.bodies[1]
             && self.anchors.iter().all(|v| v.is_finite())
             && (0.0..=1.0).contains(&self.stabilization)
+            && self.break_limit.is_none_or(|limit| {
+                limit.force.is_none_or(nonnegative) && limit.torque.is_none_or(nonnegative)
+            })
             && match self.kind {
                 JointKind::Ball => true,
                 JointKind::Distance { length } => nonnegative(length),
@@ -147,6 +174,7 @@ enum Jacobian {
     Angular,
 }
 
+#[cfg_attr(feature = "rayon", derive(Clone))]
 pub(crate) struct JointRow {
     axis: Vec3,
     jacobian: Jacobian,
@@ -352,6 +380,14 @@ pub(crate) fn prepare(joint: Joint, a: &RigidBody, b: &RigidBody, h: f64, out: &
 }
 
 impl JointRow {
+    pub(crate) fn reaction(&self) -> (Vec3, Vec3) {
+        let impulse = self.axis * self.impulse;
+        match self.jacobian {
+            Jacobian::Linear(_) => (impulse, Vec3::ZERO),
+            Jacobian::Angular => (Vec3::ZERO, impulse),
+        }
+    }
+
     pub(crate) fn cache(&self) -> JointImpulse {
         JointImpulse {
             axis: self.axis,

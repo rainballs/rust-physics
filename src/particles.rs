@@ -265,6 +265,34 @@ impl Particles {
         true
     }
 
+    /// Exchanges normal impulses with dynamic rigid boundaries. Particles
+    /// share the supplied mass, and the rigid world advances separately.
+    pub fn collide_coupled(
+        &mut self,
+        world: &mut PhysicsWorld,
+        filter: QueryFilter,
+        settings: ParticleSettings,
+        mass: f64,
+    ) -> bool {
+        let inverse_mass = mass.recip();
+        if !settings.valid() || !inverse_mass.is_finite() || inverse_mass <= 0.0 {
+            return false;
+        }
+        let targets = boundary_targets(world, filter);
+        for (position, velocity) in self.positions.iter_mut().zip(&mut self.velocities) {
+            coupled_boundary(
+                position,
+                velocity,
+                settings.radius,
+                settings.restitution,
+                inverse_mass,
+                world,
+                &targets,
+            );
+        }
+        true
+    }
+
     /// Resolves discrete particle contacts against the rigid world. Collider
     /// surface velocity contributes to bounce. Coupling is one-way.
     pub fn collide(
@@ -347,6 +375,13 @@ pub(crate) fn project_boundaries(
             on_contact(body, surface, normal);
         }
     }
+}
+
+pub(crate) fn boundary_targets(world: &PhysicsWorld, filter: QueryFilter) -> Vec<BodyHandle> {
+    world
+        .bodies()
+        .filter_map(|(id, body)| (!body.is_sensor() && filter.accepts(id, body)).then_some(id))
+        .collect()
 }
 
 pub(crate) fn coupled_boundary(

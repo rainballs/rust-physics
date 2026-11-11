@@ -6,6 +6,7 @@ use rust_physics::hull::RigidHull;
 use rust_physics::particles::{Emitter, Particle, ParticleSettings, Particles};
 use rust_physics::softbody::{SoftBody, SoftSettings};
 use rust_physics::terrain::TriangleMesh;
+use rust_physics::timestep::FixedClock;
 use rust_physics::{
     BroadPhase, Joint, JointKind, Material, PhysicsWorld, Quat, RigidBodyBuilder, Shape, StepStats,
     Vec3 as DVec3,
@@ -421,7 +422,7 @@ async fn main() {
     let mut scene = Scene::new(index);
     let mut paused = false;
     let mut options = DebugOptions::default();
-    let mut accumulator = 0.0;
+    let mut clock = FixedClock::new(DT, 4).unwrap();
     let mut yaw = 0.5_f32;
     let mut pitch = 0.44_f32;
     let mut distance = 13.0_f32;
@@ -439,7 +440,7 @@ async fn main() {
         if smoke {
             index = smoke_scene;
             scene = Scene::new(index);
-            accumulator = 0.0;
+            clock.reset();
             let start = Instant::now();
             for _ in 0..smoke_steps {
                 stats = scene.step();
@@ -459,11 +460,11 @@ async fn main() {
         if let Some(selected) = KEYS.iter().position(|&key| is_key_pressed(key)) {
             index = selected;
             scene = Scene::new(index);
-            accumulator = 0.0;
+            clock.reset();
         }
         if is_key_pressed(KeyCode::R) {
             scene = Scene::new(index);
-            accumulator = 0.0;
+            clock.reset();
         }
         if is_key_pressed(KeyCode::Space) {
             paused = !paused;
@@ -522,16 +523,20 @@ async fn main() {
                     .build(),
             );
         }
-        if paused {
-            accumulator = if is_key_pressed(KeyCode::N) { DT } else { 0.0 };
+        let steps = if smoke {
+            0
+        } else if paused {
+            clock.reset();
+            usize::from(is_key_pressed(KeyCode::N))
         } else {
-            accumulator += f64::from(get_frame_time()).min(4.0 * DT);
-        }
-        while accumulator >= DT {
+            clock
+                .plan(f64::from(get_frame_time()))
+                .map_or(0, |plan| plan.steps)
+        };
+        for _ in 0..steps {
             let start = Instant::now();
             stats = scene.step();
             last_step = start.elapsed().as_secs_f64() * 1000.0;
-            accumulator -= DT;
         }
         let mouse = mouse_position();
         if is_mouse_button_down(MouseButton::Right) {

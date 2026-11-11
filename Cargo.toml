@@ -23,10 +23,17 @@ macroquad = ["dep:macroquad"]
 name = "sandbox"
 required-features = ["macroquad"]
 
+[dev-dependencies]
+stats_alloc = "0.1"
+
 [[bench]]
 name = "throughput"
 harness = false
 
 [[bench]]
 name = "fluids"
+harness = false
+
+[[bench]]
+name = "allocations"
 harness = false

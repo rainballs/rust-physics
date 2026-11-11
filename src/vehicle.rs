@@ -74,7 +74,7 @@ impl RaycastVehicle {
             return None;
         }
         let chassis = world.body(self.chassis)?;
-        if chassis.kind() != BodyKind::Dynamic || chassis.is_sensor() {
+        if chassis.kind() != BodyKind::Dynamic || chassis.is_sensor() || !chassis.is_enabled() {
             return None;
         }
         let rotation = chassis.rotation();

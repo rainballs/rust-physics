@@ -191,3 +191,73 @@ fn motor_stalls_at_angular_hinge_limit() {
     assert!(b.angular_velocity().length() < 1e-8);
     assert!(b.rotation().angle_between(Quat::from_rotation_y(0.4)) < 1e-6);
 }
+
+#[test]
+fn supported_passive_joint_island_sleeps_and_wakes_as_a_group() {
+    let mut w = PhysicsWorld::new();
+    let a = w.add_body(RigidBodyBuilder::static_body().filter(1, 0).build());
+    let b = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(-Vec3::Y)
+            .filter(1, 0)
+            .build(),
+    );
+    let c = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(-Vec3::Y * 2.0)
+            .filter(1, 0)
+            .build(),
+    );
+    for pair in [[a, b], [b, c]] {
+        w.add_joint(Joint::new(
+            pair,
+            [Vec3::ZERO; 2],
+            JointKind::Distance { length: 1.0 },
+        ))
+        .unwrap();
+    }
+    for _ in 0..180 {
+        w.step_fixed().unwrap();
+    }
+    assert!(w.body(b).unwrap().is_sleeping() && w.body(c).unwrap().is_sleeping());
+    let tip = w.body(c).unwrap().position();
+    assert!(w.apply_impulse(c, Vec3::X * 0.4, tip));
+    w.step_fixed().unwrap();
+    assert!(!w.body(b).unwrap().is_sleeping() && !w.body(c).unwrap().is_sleeping());
+    assert!(
+        w.body(b)
+            .unwrap()
+            .position()
+            .distance(w.body(c).unwrap().position())
+            < 1.002
+    );
+}
+
+#[test]
+fn breakable_joint_reports_solved_reaction_and_releases_load() {
+    let mut w = PhysicsWorld::new();
+    let anchor = w.add_body(RigidBodyBuilder::static_body().filter(1, 0).build());
+    let load = w.add_body(RigidBodyBuilder::dynamic().position(-Vec3::Y).build());
+    let limit = rust_physics::JointBreakLimit {
+        force: Some(5.0),
+        torque: None,
+    };
+    let joint = w
+        .add_joint(
+            Joint::new(
+                [anchor, load],
+                [Vec3::ZERO; 2],
+                JointKind::Distance { length: 1.0 },
+            )
+            .breakable(limit),
+        )
+        .unwrap();
+    let stats = w.step_fixed().unwrap();
+    assert_eq!(stats.broken_joints, 1);
+    let event = w.joint_break_events()[0];
+    assert_eq!(event.joint, joint);
+    assert_eq!(event.bodies, [anchor, load]);
+    assert!((event.force - 9.81).abs() < 1e-12);
+    assert!(w.joint(joint).is_none());
+    assert!(w.body(load).unwrap().position().y < -1.0);
+}

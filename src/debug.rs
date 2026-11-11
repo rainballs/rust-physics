@@ -54,6 +54,9 @@ impl Default for DebugOptions {
 pub fn lines(world: &PhysicsWorld, options: DebugOptions, mut emit: impl FnMut(Line)) {
     let mut line = |from, to, kind| emit(Line { from, to, kind });
     for (_, b) in world.bodies() {
+        if !b.is_enabled() {
+            continue;
+        }
         let center = b.position();
         if options.colliders {
             let kind = if b.is_sensor() {

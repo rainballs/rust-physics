@@ -12,5 +12,8 @@
 - Added planar circle and rectangle dynamics, world-axis locks, origin rebasing, compound breakup, and spherical buoyancy.
 - Added PBF, SPH boundary impulses, XPBD node self-collision, particle pairs, and parallel narrow-phase work.
 - Added a uniform grid, fat-AABB tree, and translational convex casting.
+- Added stable collider views, checked stepping, in-memory replay, phase timing, and a fixed-step host clock.
+- Added convex CCD, coupled island parallelism, breakable joints, surface cloth contacts, and two-way node impulses.
+- Fixed EPA horizon growth and welded coplanar terrain seams for sphere contacts and casts.
 - Fixed CCD event-budget exhaustion so unrelated bodies advance the full timestep.
 - Added headless drop, deformable tetrahedron, and stress examples, a graphical sandbox, regression tests, and release benchmark targets.
