@@ -24,9 +24,11 @@ The graphical smoke test advances all ten scenes and both fluid solvers in a des
 
 ## Current limits and next work
 
-- Rotating convex CCD against static targets is experimental. Synchronized moving-target CCD beyond spheres remains open. Budget fallbacks use discrete contacts for the remaining interval and report a statistic.
+- Rotating convex CCD against static targets is experimental. Synchronized convex CCD is opt-in. Rotating dynamic targets must also opt in to use the same frozen-spin path. Budget fallbacks use discrete contacts for the remaining interval and report a statistic.
 - Serial rigid solving is the default. Rayon is optional for particle updates, narrow-phase contact generation, and disjoint coupled islands.
 - Mixed convex and mesh contact manifolds use bounded, experimental GJK/EPA and can miss difficult degeneracies. Improve mixed-shape stacking tests and terrain seam handling.
 - PBF uses one-way discrete boundary projection. SPH, particles, and deformable nodes can exchange normal impulses with rigid bodies. Cloth surface self-contact is discrete.
 - `PlanarWorld` exposes circle, rectangle, and half-plane dynamics. Additional planar shape types and query helpers remain open.
 - Compare workloads in PERFORMANCE before changing the default broad phase.
+
+The bounded preview milestone adds point-cloud hull construction, clipped convex contact patches, capsule step climbing, contact impulse reports, and synchronized convex CCD. Four release soak shards covering seeds 192 through 1215 passed 7,372,800 steps on the preceding revision. The newest CCD mode has targeted regression coverage.

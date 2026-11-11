@@ -50,6 +50,8 @@ pub struct Settings {
     pub parallel_narrow_phase: bool,
     /// Solves sufficiently large disjoint contact islands with Rayon.
     pub parallel_islands: bool,
+    /// Records each solved contact impulse for inspection after a step.
+    pub contact_impulse_reporting: bool,
     pub fixed_dt: f64,
     pub substeps: usize,
     pub iterations: usize,
@@ -65,6 +67,8 @@ pub struct Settings {
     pub ccd_moving_spheres: bool,
     /// Enables experimental translating and rotating convex CCD against static targets.
     pub ccd_convex: bool,
+    /// Enables synchronized experimental CCD between moving convex solids.
+    pub ccd_moving_convex: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +79,7 @@ impl Default for Settings {
             grid_cell_size: 1.0,
             parallel_narrow_phase: false,
             parallel_islands: false,
+            contact_impulse_reporting: false,
             fixed_dt: 1.0 / 60.0,
             substeps: 2,
             iterations: 12,
@@ -87,6 +92,7 @@ impl Default for Settings {
             ccd: true,
             ccd_moving_spheres: false,
             ccd_convex: false,
+            ccd_moving_convex: false,
         }
     }
 }
@@ -178,6 +184,26 @@ pub struct CollisionEvent {
     pub b: BodyHandle,
     pub sensor: bool,
     pub started: bool,
+}
+
+/// Impulse applied to B at a solved contact. A receives the opposite impulse.
+#[derive(Clone, Copy, Debug)]
+pub struct ContactImpulse {
+    pub bodies: [BodyHandle; 2],
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub normal_impulse: f64,
+    pub tangential_impulse: Vec3,
+    /// Seconds from the start of the public step to the end of this substep.
+    pub time: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct JointReaction {
+    /// Average force applied to the second joint body in the last substep.
+    pub force: Vec3,
+    /// Average torque from angular rows, excluding moments of linear rows.
+    pub torque: Vec3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,6 +410,7 @@ pub struct WorldSnapshot {
     joints: BTreeMap<JointHandle, Joint>,
     joint_cache: BTreeMap<JointHandle, Vec<JointImpulse>>,
     joint_breaks: Vec<JointBreakEvent>,
+    contact_impulses: Vec<ContactImpulse>,
 }
 
 pub struct PhysicsWorld {
@@ -410,6 +437,7 @@ pub struct PhysicsWorld {
     joints: BTreeMap<JointHandle, Joint>,
     joint_cache: BTreeMap<JointHandle, Vec<JointImpulse>>,
     joint_breaks: Vec<JointBreakEvent>,
+    contact_impulses: Vec<ContactImpulse>,
 }
 
 impl Default for PhysicsWorld {
@@ -446,6 +474,7 @@ impl PhysicsWorld {
             joints: BTreeMap::new(),
             joint_cache: BTreeMap::new(),
             joint_breaks: Vec::new(),
+            contact_impulses: Vec::new(),
         }
     }
 
@@ -466,6 +495,7 @@ impl PhysicsWorld {
             joints: self.joints.clone(),
             joint_cache: self.joint_cache.clone(),
             joint_breaks: self.joint_breaks.clone(),
+            contact_impulses: self.contact_impulses.clone(),
         }
     }
 
@@ -495,6 +525,7 @@ impl PhysicsWorld {
         self.joints.clone_from(&snapshot.joints);
         self.joint_cache.clone_from(&snapshot.joint_cache);
         self.joint_breaks.clone_from(&snapshot.joint_breaks);
+        self.contact_impulses.clone_from(&snapshot.contact_impulses);
         self.dynamic_tree = DynamicTree::default();
         true
     }
@@ -532,6 +563,10 @@ impl PhysicsWorld {
                 .iter()
                 .any(|(_, _, c)| !(c.point - offset).is_finite())
             || self
+                .contact_impulses
+                .iter()
+                .any(|hit| !(hit.point - offset).is_finite())
+            || self
                 .impacts
                 .iter()
                 .any(|hit| !(hit.point - offset).is_finite())
@@ -542,6 +577,9 @@ impl PhysicsWorld {
             body.position -= offset;
         }
         for (_, _, contact) in &mut self.debug_contacts {
+            contact.point -= offset;
+        }
+        for contact in &mut self.contact_impulses {
             contact.point -= offset;
         }
         for impact in &mut self.impacts {

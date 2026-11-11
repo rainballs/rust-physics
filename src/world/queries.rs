@@ -1,7 +1,7 @@
 //! World query and event accessors.
 use super::{
-    BodyHandle, CcdImpact, CollisionEvent, Contact, JointBreakEvent, PhysicsWorld, PointHit,
-    QueryFilter, Ray, RayHit, Shape, Vec3,
+    BodyHandle, CcdImpact, CollisionEvent, Contact, ContactImpulse, JointBreakEvent, JointHandle,
+    JointReaction, PhysicsWorld, PointHit, QueryFilter, Ray, RayHit, Shape, Vec3,
 };
 use crate::RigidBody;
 use crate::spatial::{Aabb, SpatialIndex, cast_convex_body, project, ray_body, sphere_hit};
@@ -15,6 +15,28 @@ impl PhysicsWorld {
     /// Joint failures observed during the last successful step.
     pub fn joint_break_events(&self) -> &[JointBreakEvent] {
         &self.joint_breaks
+    }
+
+    /// Solved contact responses collected when reporting is enabled.
+    pub fn contact_impulses(&self) -> &[ContactImpulse] {
+        &self.contact_impulses
+    }
+
+    /// Returns the measured reaction from the last completed joint solve.
+    pub fn joint_reaction(&self, handle: JointHandle) -> Option<JointReaction> {
+        let h = self.previous_h?;
+        let rows = self.joint_cache.get(&handle)?;
+        if rows.is_empty() {
+            return None;
+        }
+        let (linear, angular) = rows
+            .iter()
+            .map(|row| row.reaction())
+            .fold((Vec3::ZERO, Vec3::ZERO), |(a, b), (c, d)| (a + c, b + d));
+        Some(JointReaction {
+            force: linear / h,
+            torque: angular / h,
+        })
     }
 
     /// Swept impacts sorted by time within the last successful step.

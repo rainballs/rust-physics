@@ -618,3 +618,66 @@ fn sleeping_manifold_reuse_invalidates_when_support_moves() {
     assert!(!world.body(sphere).unwrap().is_sleeping());
     assert!(world.body(sphere).unwrap().position().y > 0.6);
 }
+
+#[test]
+fn reported_resting_contact_impulse_balances_weight() {
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        contact_impulse_reporting: true,
+        sleep_time: 0.0,
+        ..Default::default()
+    })
+    .unwrap();
+    floor(&mut w);
+    let id = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(Vec3::Y * 0.5)
+            .mass(2.0)
+            .build(),
+    );
+    w.step_fixed().unwrap();
+    let impulses = w.contact_impulses();
+    assert_eq!(impulses.len(), 2);
+    assert!(
+        impulses
+            .iter()
+            .all(|i| i.bodies[1] == id && i.normal == Vec3::Y)
+    );
+    let sum: f64 = impulses.iter().map(|i| i.normal_impulse).sum();
+    assert!((sum - 2.0 * 9.81 / 60.0).abs() < 1e-12);
+}
+
+#[test]
+fn synchronized_convex_ccd_detects_two_fast_boxes_between_discrete_poses() {
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        gravity: Vec3::ZERO,
+        ccd_moving_convex: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let material = Material {
+        restitution: 1.0,
+        ..Default::default()
+    };
+    let [a, b] = [-1.0, 1.0].map(|side| {
+        w.add_body(
+            RigidBodyBuilder::dynamic()
+                .shape(Shape::cuboid(Vec3::new(0.2, 0.4, 0.3)))
+                .position(Vec3::X * (3.0 * side))
+                .velocity(-Vec3::X * (450.0 * side))
+                .material(material)
+                .ccd(true)
+                .build(),
+        )
+    });
+    let stats = w.step_fixed().unwrap();
+    assert_eq!(stats.ccd_impacts, 1);
+    let impact = w.ccd_impacts()[0];
+    assert_eq!((impact.moving, impact.target), (a, b));
+    assert!((impact.time - (6.0 - 0.4) / 900.0).abs() < 1e-7);
+    let [a, b] = [a, b].map(|id| w.body(id).unwrap());
+    assert!(a.velocity().distance(-Vec3::X * 450.0) < 1e-7);
+    assert!(b.velocity().distance(Vec3::X * 450.0) < 1e-7);
+    assert!(a.angular_velocity().length() + b.angular_velocity().length() < 1e-6);
+}

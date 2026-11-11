@@ -605,24 +605,59 @@ impl Aabb {
         point.distance_squared(point.clamp(self.min, self.max))
     }
 
-    pub(crate) fn hit_ray(self, origin: Vec3, direction: Vec3, mut far: f64) -> bool {
+    pub(crate) fn hit_ray(self, origin: Vec3, direction: Vec3, far: f64) -> bool {
+        RaySlabs::new(origin, direction, Vec3::ZERO)
+            .entry(self, far)
+            .is_some()
+    }
+}
+
+struct RaySlabs {
+    origin: Vec3,
+    direction: Vec3,
+    reciprocal: Vec3,
+    padding: Vec3,
+}
+
+impl RaySlabs {
+    fn new(origin: Vec3, direction: Vec3, padding: Vec3) -> Self {
+        Self {
+            origin,
+            direction,
+            reciprocal: direction.recip(),
+            padding,
+        }
+    }
+
+    fn entry(&self, bounds: Aabb, mut far: f64) -> Option<f64> {
+        let min = bounds.min - self.padding;
+        let max = bounds.max + self.padding;
         let mut near: f64 = 0.0;
-        for axis in 0..3 {
-            if direction[axis] == 0.0 {
-                if origin[axis] < self.min[axis] || origin[axis] > self.max[axis] {
-                    return false;
+        for i in 0..3 {
+            if self.direction[i] == 0.0 {
+                if self.origin[i] < min[i] || self.origin[i] > max[i] {
+                    return None;
                 }
                 continue;
             }
-            let a = (self.min[axis] - origin[axis]) / direction[axis];
-            let b = (self.max[axis] - origin[axis]) / direction[axis];
+            let [a, b] = if self.reciprocal[i].is_finite() {
+                [
+                    (min[i] - self.origin[i]) * self.reciprocal[i],
+                    (max[i] - self.origin[i]) * self.reciprocal[i],
+                ]
+            } else {
+                [
+                    (min[i] - self.origin[i]) / self.direction[i],
+                    (max[i] - self.origin[i]) / self.direction[i],
+                ]
+            };
             near = near.max(a.min(b));
             far = far.min(a.max(b));
             if near > far {
-                return false;
+                return None;
             }
         }
-        true
+        Some(near)
     }
 }
 
@@ -675,6 +710,59 @@ impl Bvh {
     ) {
         if !self.nodes.is_empty() {
             self.visit_node(0, &mut intersects, &mut visit_leaf);
+        }
+    }
+
+    /// Traverses nearer ray branches first. The leaf callback returns a
+    /// tighter distance bound after an exact hit.
+    pub fn visit_ray(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        padding: Vec3,
+        mut far: f64,
+        mut visit: impl FnMut(usize, f64) -> Option<f64>,
+    ) {
+        let ray = RaySlabs::new(origin, direction, padding);
+        if let Some(root) = self.nodes.first()
+            && let Some(entry) = ray.entry(root.bounds, far)
+        {
+            self.visit_ray_node(0, entry, &ray, &mut far, &mut visit);
+        }
+    }
+
+    fn visit_ray_node(
+        &self,
+        index: usize,
+        entry: f64,
+        ray: &RaySlabs,
+        far: &mut f64,
+        visit: &mut impl FnMut(usize, f64) -> Option<f64>,
+    ) {
+        if entry > *far {
+            return;
+        }
+        match self.nodes[index].kind {
+            NodeKind::Leaf(id) => {
+                if let Some(hit) = visit(id, *far) {
+                    *far = far.min(hit);
+                }
+            }
+            NodeKind::Branch { right } => {
+                let left = index + 1;
+                let a = ray.entry(self.nodes[left].bounds, *far);
+                let b = ray.entry(self.nodes[right].bounds, *far);
+                let (first, second) = if a.unwrap_or(f64::INFINITY) <= b.unwrap_or(f64::INFINITY) {
+                    ((left, a), (right, b))
+                } else {
+                    ((right, b), (left, a))
+                };
+                for (i, entry) in [first, second] {
+                    if let Some(entry) = entry {
+                        self.visit_ray_node(i, entry, ray, far, visit);
+                    }
+                }
+            }
         }
     }
 
@@ -921,18 +1009,21 @@ impl<'a> SpatialIndex<'a> {
             return None;
         }
         let mut best: Option<RayHit> = None;
-        let mut test = |index: usize| {
+        let mut test = |index: usize, far: f64| {
             let (body, b) = self.bodies[index];
             if !filter.accepts(body, b) {
-                return;
+                return None;
             }
-            if let Some((distance, normal)) = ray_body(b, ray.origin, direction)
-                && distance.is_finite()
-                && distance <= ray.max_distance
-                && best.is_none_or(|hit| {
-                    distance < hit.distance || (distance == hit.distance && body < hit.body)
-                })
-            {
+            let (distance, normal) = ray_body(b, ray.origin, direction)?;
+            if !distance.is_finite() || distance > far {
+                return None;
+            }
+            if best.is_none_or(|hit| {
+                distance
+                    .total_cmp(&hit.distance)
+                    .then(body.cmp(&hit.body))
+                    .is_lt()
+            }) {
                 best = Some(RayHit {
                     body,
                     position: ray.origin + direction * distance,
@@ -940,14 +1031,16 @@ impl<'a> SpatialIndex<'a> {
                     distance,
                 });
             }
+            Some(distance)
         };
-        self.bvh.visit(
-            |aabb| aabb.hit_ray(ray.origin, direction, ray.max_distance),
-            &mut test,
-        );
+        let mut far = ray.max_distance;
         for &plane in &self.planes {
-            test(plane);
+            if let Some(hit) = test(plane, far) {
+                far = far.min(hit);
+            }
         }
+        self.bvh
+            .visit_ray(ray.origin, direction, Vec3::ZERO, far, test);
         best
     }
 
@@ -980,32 +1073,30 @@ impl<'a> SpatialIndex<'a> {
             );
         }
         let mut best: Option<RayHit> = None;
-        let mut test = |index: usize| {
+        let mut test = |index: usize, far: f64| {
             let (body, collider) = self.bodies[index];
-            if filter.accepts(body, collider)
-                && let Some(hit) =
-                    sphere_hit(body, collider, origin, direction, radius, max_distance)
-                && best.is_none_or(|b| {
-                    hit.distance
-                        .total_cmp(&b.distance)
-                        .then(hit.body.cmp(&b.body))
-                        .is_lt()
-                })
-            {
+            if !filter.accepts(body, collider) {
+                return None;
+            }
+            let hit = sphere_hit(body, collider, origin, direction, radius, far)?;
+            if best.is_none_or(|b| {
+                hit.distance
+                    .total_cmp(&b.distance)
+                    .then(hit.body.cmp(&b.body))
+                    .is_lt()
+            }) {
                 best = Some(hit);
             }
+            Some(hit.distance)
         };
-        self.bvh.visit(
-            |bounds| {
-                bounds
-                    .expanded(radius)
-                    .hit_ray(origin, direction, max_distance)
-            },
-            &mut test,
-        );
+        let mut far = max_distance;
         for &plane in &self.planes {
-            test(plane);
+            if let Some(hit) = test(plane, far) {
+                far = far.min(hit);
+            }
         }
+        self.bvh
+            .visit_ray(origin, direction, Vec3::splat(radius), far, test);
         best
     }
 

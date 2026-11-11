@@ -32,6 +32,7 @@ pub use glam::{DMat2 as Mat2, DMat3 as Mat3, DMat4 as Mat4, DQuat as Quat};
 pub use glam::{DVec2 as Vec2, DVec3 as Vec3, DVec4 as Vec4};
 pub use joints::{HingeLimits, Joint, JointBreakLimit, JointHandle, JointKind, Motor};
 pub use world::{
-    BodyHandle, BroadPhase, CcdImpact, JointBreakEvent, NumericalStage, PhysicsWorld, ProfiledStep,
-    QueryFilter, Ray, RayHit, Settings, StepError, StepStats, StepTimings, WorldSnapshot,
+    BodyHandle, BroadPhase, CcdImpact, ContactImpulse, JointBreakEvent, JointReaction,
+    NumericalStage, PhysicsWorld, ProfiledStep, QueryFilter, Ray, RayHit, Settings, StepError,
+    StepStats, StepTimings, WorldSnapshot,
 };

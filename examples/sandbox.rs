@@ -604,6 +604,12 @@ async fn main() {
             17.0,
             WHITE,
         );
+        if smoke
+            && index == 5
+            && let Some(path) = std::env::var_os("RUST_PHYSICS_PREVIEW")
+        {
+            get_screen_data().export_png(&path.to_string_lossy());
+        }
         next_frame().await;
         if smoke {
             assert!(scene.world.bodies().all(|(_, b)| b.position().is_finite()));

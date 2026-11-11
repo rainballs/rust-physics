@@ -154,15 +154,22 @@ impl TriangleMesh {
 
     pub(crate) fn ray(&self, origin: Vec3, direction: Vec3) -> Option<(f64, Vec3)> {
         let mut best = None;
-        self.bvh.visit(
-            |bounds| bounds.hit_ray(origin, direction, f64::INFINITY),
-            |index| {
-                if let Some((t, n)) = ray_triangle(origin, direction, self.triangle(index))
-                    && best
-                        .is_none_or(|(distance, i, _)| t < distance || (t == distance && index < i))
+        self.bvh.visit_ray(
+            origin,
+            direction,
+            Vec3::ZERO,
+            f64::INFINITY,
+            |index, far| {
+                let (t, n) =
+                    ray_triangle(origin, direction, self.triangle(index), self.normals[index])?;
+                if t > far {
+                    return None;
+                }
+                if best.is_none_or(|(distance, i, _)| t < distance || (t == distance && index < i))
                 {
                     best = Some((t, index, n));
                 }
+                Some(t)
             },
         );
         best.map(|(t, _, n)| (t, n))
@@ -221,24 +228,16 @@ impl TriangleMesh {
         let tolerance = extent.max_element() * 1e-6;
         let support = PrimitiveSupport::new(moving)?;
         let mut best = None;
-        self.bvh.visit(
-            |node| {
-                Aabb {
-                    min: node.min - extent,
-                    max: node.max + extent,
-                }
-                .hit_ray(center, direction, max)
-            },
-            |index| {
+        self.bvh
+            .visit_ray(center, direction, extent, max, |index, far| {
                 let triangle = TriangleSupport(self.triangle(index));
-                if let Some((t, n, p)) =
-                    convex::cast_translation(&triangle, &support, direction, max, tolerance)
-                    && best.is_none_or(|(old, _, _, j)| t < old || (t == old && index < j))
-                {
+                let (t, n, p) =
+                    convex::cast_translation(&triangle, &support, direction, far, tolerance)?;
+                if best.is_none_or(|(old, _, _, j)| t < old || (t == old && index < j)) {
                     best = Some((t, n, p, index));
                 }
-            },
-        );
+                Some(t)
+            });
         best.map(|(t, n, p, _)| (t, n, p))
     }
 
@@ -250,24 +249,25 @@ impl TriangleMesh {
         max: f64,
     ) -> Option<(f64, Vec3)> {
         let mut best = None;
-        self.bvh.visit(
-            |bounds| bounds.expanded(radius).hit_ray(origin, direction, max),
-            |index| {
-                if let Some((t, n)) = cast_triangle(
+        self.bvh
+            .visit_ray(origin, direction, Vec3::splat(radius), max, |index, far| {
+                let (t, n) = cast_triangle(
                     origin,
                     direction,
                     radius,
                     self.triangle(index),
                     self.normals[index],
                     self.active_edges[index],
-                ) && t <= max
-                    && best
-                        .is_none_or(|(distance, i, _)| t < distance || (t == distance && index < i))
+                )?;
+                if t > far {
+                    return None;
+                }
+                if best.is_none_or(|(distance, i, _)| t < distance || (t == distance && index < i))
                 {
                     best = Some((t, index, n));
                 }
-            },
-        );
+                Some(t)
+            });
         best.map(|(t, _, n)| (t, n))
     }
 }
@@ -311,8 +311,12 @@ fn closest_feature(
     (nearest, Some((edge, t)))
 }
 
-fn ray_triangle(origin: Vec3, direction: Vec3, triangle: [Vec3; 3]) -> Option<(f64, Vec3)> {
-    let normal = triangle_normal(triangle);
+fn ray_triangle(
+    origin: Vec3,
+    direction: Vec3,
+    triangle: [Vec3; 3],
+    normal: Vec3,
+) -> Option<(f64, Vec3)> {
     let denominator = normal.dot(direction);
     if denominator == 0.0 {
         return None;

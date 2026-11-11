@@ -88,16 +88,7 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
                 half_segment: bh,
             },
         ) => {
-            let u = a.rotation * Vec3::Y;
-            let v = b.rotation * Vec3::Y;
-            let (p, q) = closest_segments(
-                a.position - u * ah,
-                u * (2.0 * ah),
-                b.position - v * bh,
-                v * (2.0 * bh),
-            );
-            let normal = u.cross(v).try_normalize().unwrap_or(a.rotation * Vec3::X);
-            rounded_points(p, q, *ar, *br, normal, out);
+            capsule_capsule(a, b, [*ar, *br], [*ah, *bh], out);
         }
         (Shape::Capsule { .. }, Shape::Sphere { radius }) => capsule_sphere(a, b, *radius, out),
         (Shape::Sphere { radius }, Shape::Capsule { .. }) => {
@@ -232,23 +223,55 @@ fn compound_contacts(
 }
 
 fn reduce_contacts(out: &mut Vec<Contact>, start: usize) {
-    // Contact caching has a fixed eight-point budget. Prefer deeper and
-    // distinct witnesses, with stable child order for ties.
-    if out.len() - start > 8 {
-        out[start..].sort_by(|a, b| b.depth.total_cmp(&a.depth));
-    }
+    let distinct = |a: Contact, b: Contact| {
+        a.normal.dot(b.normal) <= 1.0 - 1e-8 || a.point.distance_squared(b.point) >= 1e-14
+    };
     let mut count = start;
-    for i in start..out.len() {
-        let contact = out[i];
-        if !out[start..count].iter().any(|existing| {
-            existing.normal.dot(contact.normal) > 1.0 - 1e-8
-                && existing.point.distance_squared(contact.point) < 1e-14
-        }) {
-            out[count] = contact;
-            count += 1;
-            if count == start + 8 {
-                break;
+    if out.len() - start <= 8 {
+        for i in start..out.len() {
+            let contact = out[i];
+            if out[start..count].iter().all(|&old| distinct(contact, old)) {
+                out[count] = contact;
+                count += 1;
             }
+        }
+    } else {
+        let deepest = (start..out.len())
+            .max_by(|&a, &b| out[a].depth.total_cmp(&out[b].depth))
+            .expect("nonempty manifold");
+        out.swap(start, deepest);
+        let scale = out[start..]
+            .iter()
+            .map(|c| c.point.distance_squared(out[start].point))
+            .fold(1e-12, f64::max);
+        count += 1;
+        while count < start + 8 {
+            let best = (count..out.len())
+                .filter_map(|index| {
+                    let candidate = out[index];
+                    out[start..count]
+                        .iter()
+                        .all(|&old| distinct(candidate, old))
+                        .then(|| {
+                            let spread = out[start..count]
+                                .iter()
+                                .map(|old| {
+                                    candidate.point.distance_squared(old.point)
+                                        + scale * (1.0 - candidate.normal.dot(old.normal)).max(0.0)
+                                })
+                                .fold(f64::INFINITY, f64::min);
+                            (index, spread)
+                        })
+                })
+                .max_by(|a, b| {
+                    a.1.total_cmp(&b.1)
+                        .then(out[a.0].depth.total_cmp(&out[b.0].depth))
+                });
+            let Some((index, _)) = best else {
+                break;
+            };
+            out.swap(count, index);
+            count += 1;
         }
     }
     out.truncate(count);
@@ -540,57 +563,199 @@ fn parallel_cylinders(
     if cap_depth < 0.0 || side_depth < 0.0 {
         return;
     }
-    let (point, normal, depth) = if cap_depth <= side_depth {
+    let start = out.len();
+    if cap_depth <= side_depth {
         let n = axis * axial.signum();
-        let fraction = if lateral_distance > 0.0 {
-            let low = (lateral_distance - br).max(-ar);
-            let high = (lateral_distance + br).min(ar);
-            0.5 * (low + high) / lateral_distance
+        let u = lateral
+            .try_normalize()
+            .unwrap_or_else(|| axis.any_orthonormal_vector());
+        let v = axis.cross(u);
+        let low = (lateral_distance - br).max(-ar);
+        let high = (lateral_distance + br).min(ar);
+        let chord = if lateral_distance > 0.0 {
+            (ar * ar - br * br + lateral_distance * lateral_distance) / (2.0 * lateral_distance)
         } else {
             0.0
         };
-        (
-            a + lateral * fraction + n * (ah - cap_depth * 0.5),
-            n,
-            cap_depth,
-        )
+        let width = |x: f64| {
+            (ar * ar - x * x)
+                .min(br * br - (x - lateral_distance).powi(2))
+                .max(0.0)
+        };
+        let widest = [0.0, lateral_distance, chord]
+            .map(|x| x.clamp(low, high))
+            .into_iter()
+            .max_by(|&a, &b| width(a).total_cmp(&width(b)))
+            .unwrap();
+        let half_width = width(widest).sqrt();
+        let center = a + n * (ah - cap_depth * 0.5);
+        for point in [
+            center + u * low,
+            center + u * high,
+            center + u * widest - v * half_width,
+            center + u * widest + v * half_width,
+        ] {
+            out.push(Contact {
+                point,
+                normal: n,
+                depth: cap_depth,
+            });
+        }
     } else {
         let n = lateral
             .try_normalize()
             .unwrap_or_else(|| axis.any_orthonormal_vector());
         let low = (axial - bh).max(-ah);
         let high = (axial + bh).min(ah);
-        (
-            a + axis * ((low + high) * 0.5) + n * (ar - side_depth * 0.5),
-            n,
-            side_depth,
-        )
-    };
-    out.push(Contact {
-        point,
-        normal,
-        depth,
-    });
+        let center = a + n * (ar - side_depth * 0.5);
+        for t in [low, high] {
+            out.push(Contact {
+                point: center + axis * t,
+                normal: n,
+                depth: side_depth,
+            });
+        }
+    }
+    reduce_contacts(out, start);
 }
 
 fn convex_pair(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
     let [ab, bb] = [a, b].map(|b| Aabb::of(b).expect("finite convex shape"));
     let scale = (ab.max - ab.min).max(bb.max - bb.min).max_element();
-    let a = PrimitiveSupport::new(a).expect("finite convex shape");
-    let b = PrimitiveSupport::new(b).expect("finite convex shape");
+    let support_a = PrimitiveSupport::new(a).expect("finite convex shape");
+    let support_b = PrimitiveSupport::new(b).expect("finite convex shape");
     if let ConvexContact::Penetrating {
         depth,
         normal,
         point_a,
         point_b,
-    } = convex::query(&a, &b, scale * 1e-6)
+    } = convex::query(&support_a, &support_b, scale * 1e-6)
     {
+        if polyhedral_patch(a, b, normal, out) {
+            return;
+        }
         out.push(Contact {
             point: (point_a + point_b) * 0.5,
             normal,
             depth,
         });
     }
+}
+
+struct FacePolygon {
+    normal: Vec3,
+    points: Vec<Vec3>,
+}
+
+fn polyhedral_face(body: &RigidBody, direction: Vec3) -> Option<FacePolygon> {
+    match body.shape {
+        Shape::Cuboid { half_extents } => {
+            let box_shape = Obb::new(body, half_extents);
+            let axis = box_shape.face_axis(direction);
+            let positive = box_shape.axes[axis].dot(direction) >= 0.0;
+            let normal = if positive {
+                box_shape.axes[axis]
+            } else {
+                -box_shape.axes[axis]
+            };
+            let mut points = box_shape.face(axis, normal).to_vec();
+            if !positive {
+                points.reverse();
+            }
+            Some(FacePolygon { normal, points })
+        }
+        Shape::Cylinder {
+            radius,
+            half_height,
+        } => {
+            let axis = body.rotation * Vec3::Y;
+            let alignment = axis.dot(direction);
+            if alignment.abs() < 1.0 - 1e-5 {
+                return None;
+            }
+            let normal = axis * alignment.signum();
+            let center = body.position + normal * half_height;
+            let (u, v) = normal.any_orthonormal_pair();
+            // Inscribed samples approximate only the patch. GJK/EPA uses
+            // the exact cylindrical support function for intersection.
+            let points = (0..16)
+                .map(|i| {
+                    let angle = std::f64::consts::TAU * f64::from(i) / 16.0;
+                    center + (u * angle.cos() + v * angle.sin()) * radius
+                })
+                .collect();
+            Some(FacePolygon { normal, points })
+        }
+        Shape::Hull(ref hull) => {
+            let (normal, polygon) = hull.support_face(body.rotation.conjugate() * direction);
+            let points = polygon
+                .iter()
+                .map(|&i| body.position + body.rotation * hull.surface().vertices()[i])
+                .collect();
+            Some(FacePolygon {
+                normal: body.rotation * normal,
+                points,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn polyhedral_patch(a: &RigidBody, b: &RigidBody, direction: Vec3, out: &mut Vec<Contact>) -> bool {
+    // Smooth features still use the EPA witness.
+    if !matches!(
+        a.shape,
+        Shape::Cuboid { .. } | Shape::Hull(_) | Shape::Cylinder { .. }
+    ) || !matches!(
+        b.shape,
+        Shape::Cuboid { .. } | Shape::Hull(_) | Shape::Cylinder { .. }
+    ) {
+        return false;
+    }
+    let (Some(a), Some(b)) = (
+        polyhedral_face(a, direction),
+        polyhedral_face(b, -direction),
+    ) else {
+        return false;
+    };
+    let alignment_a = a.normal.dot(direction);
+    let alignment_b = b.normal.dot(-direction);
+    if alignment_a.max(alignment_b) < 1.0 - 1e-5 {
+        return false;
+    }
+    let (reference, incident, sign) = if alignment_a >= alignment_b {
+        (a, b, 1.0)
+    } else {
+        (b, a, -1.0)
+    };
+    let mut polygon = incident.points;
+    let mut scratch = Vec::new();
+    for i in 0..reference.points.len() {
+        let origin = reference.points[i];
+        let edge = reference.points[(i + 1) % reference.points.len()] - origin;
+        let n = edge.cross(reference.normal);
+        scratch.resize(polygon.len() + 1, Vec3::ZERO);
+        let count = clip_polygon(&polygon, &mut scratch, |p| (p - origin).dot(n));
+        if count == 0 {
+            return false;
+        }
+        scratch.truncate(count);
+        std::mem::swap(&mut polygon, &mut scratch);
+    }
+    let start = out.len();
+    let n = reference.normal;
+    for point in polygon {
+        let depth = (reference.points[0] - point).dot(n);
+        if depth >= 0.0 {
+            out.push(Contact {
+                point: point + n * depth * 0.5,
+                normal: n * sign,
+                depth,
+            });
+        }
+    }
+    reduce_contacts(out, start);
+    out.len() > start
 }
 
 fn cylinder_plane_points(
@@ -654,6 +819,39 @@ fn project_planar_box(cube: &RigidBody, h: Vec3, center: Vec3) -> (Vec3, Vec3, f
         cube.rotation * normal,
         distance,
     )
+}
+
+fn capsule_capsule(
+    a: &RigidBody,
+    b: &RigidBody,
+    [ar, br]: [f64; 2],
+    [ah, bh]: [f64; 2],
+    out: &mut Vec<Contact>,
+) {
+    let u = a.rotation * Vec3::Y;
+    let v = b.rotation * Vec3::Y;
+    let cross = u.cross(v);
+    let fallback = cross.try_normalize().unwrap_or(a.rotation * Vec3::X);
+    if cross.length_squared() < 1e-20 {
+        let projection = (b.position - a.position).dot(u);
+        let low = (-ah).max(projection - bh);
+        let high = ah.min(projection + bh);
+        if high - low > 1e-6 * ar.min(br) {
+            let lateral = b.position - a.position - u * projection;
+            for t in [low, high] {
+                let p = a.position + u * t;
+                rounded_points(p, p + lateral, ar, br, fallback, out);
+            }
+            return;
+        }
+    }
+    let (p, q) = closest_segments(
+        a.position - u * ah,
+        u * (2.0 * ah),
+        b.position - v * bh,
+        v * (2.0 * bh),
+    );
+    rounded_points(p, q, ar, br, fallback, out);
 }
 
 fn capsule_sphere(capsule: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
@@ -792,11 +990,51 @@ fn box_capsule(cube: &RigidBody, h: Vec3, capsule: &RigidBody, out: &mut Vec<Con
         let feature = center - axis * (half_segment * sign) - n * radius;
         (depth, n, feature + n * (depth * 0.5))
     };
+    let face = min_axis(-normal.abs());
+    if normal[face].abs() > 1.0 - 1e-10
+        && axis[face].abs() < 1e-10
+        && let Some([low, high]) = clip_segment_to_face(origin, segment, h, face)
+        && (high - low) * segment.length() > radius * 1e-6
+    {
+        let normal = Vec3::AXES[face] * normal[face].signum();
+        for t in [low, high] {
+            let cap = origin + segment * t;
+            let mut face_point = cap.clamp(-h, h);
+            face_point[face] = normal[face] * h[face];
+            let depth = radius - (cap - face_point).dot(normal);
+            if depth >= 0.0 {
+                out.push(Contact {
+                    point: cube.position + cube.rotation * (face_point - normal * depth * 0.5),
+                    normal: cube.rotation * normal,
+                    depth,
+                });
+            }
+        }
+        return;
+    }
     out.push(Contact {
         point: cube.position + cube.rotation * point,
         normal: cube.rotation * normal,
         depth,
     });
+}
+
+fn clip_segment_to_face(origin: Vec3, segment: Vec3, h: Vec3, face: usize) -> Option<[f64; 2]> {
+    let mut low: f64 = 0.0;
+    let mut high: f64 = 1.0;
+    for axis in [(face + 1) % 3, (face + 2) % 3] {
+        if segment[axis] == 0.0 {
+            if origin[axis].abs() > h[axis] {
+                return None;
+            }
+            continue;
+        }
+        let a = (-h[axis] - origin[axis]) / segment[axis];
+        let b = (h[axis] - origin[axis]) / segment[axis];
+        low = low.max(a.min(b));
+        high = high.min(a.max(b));
+    }
+    (low <= high).then_some([low, high])
 }
 
 fn min_axis(v: Vec3) -> usize {

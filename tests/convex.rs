@@ -116,9 +116,12 @@ fn cylinder_box_uses_support_map_and_parallel_cylinders_resolve() {
     contacts(&cuboid, &cylinder(Vec3::X * 1.6), &mut output);
     assert!(output.is_empty());
     contacts(&cylinder(Vec3::ZERO), &cylinder(Vec3::ZERO), &mut output);
-    assert_eq!(output.len(), 1);
-    assert!((output[0].depth - 1.0).abs() < 1e-12);
-    assert!(output[0].normal.is_normalized());
+    assert_eq!(output.len(), 2);
+    assert!(
+        output
+            .iter()
+            .all(|c| (c.depth - 1.0).abs() < 1e-12 && c.normal.is_normalized())
+    );
 }
 
 #[test]
@@ -182,4 +185,100 @@ fn gjk_distance_returns_closest_witnesses() {
     assert!((distance - 2.0_f64.sqrt()).abs() < 1e-12);
     assert!(normal.distance((Vec3::X + Vec3::Y).normalize()) < 1e-12);
     assert!((point_b - point_a).distance(Vec3::X + Vec3::Y) < 1e-12);
+}
+
+#[test]
+fn point_cloud_hull_removes_interior_points_and_matches_cube_mass_properties() {
+    use rust_physics::hull::RigidHull;
+    use std::sync::Arc;
+    let source = cube();
+    let mut points = source.points().to_vec();
+    points.extend([Vec3::ZERO, Vec3::X * 0.3, Vec3::ONE, Vec3::Y * 0.7]);
+    points.reverse();
+    let hull = Arc::new(RigidHull::from_points(points).unwrap());
+    assert_eq!(hull.surface().vertices().len(), 8);
+    assert_eq!(hull.surface().triangles().len(), 12);
+    assert!(hull.input_center().length() < 1e-12);
+    let b = RigidBodyBuilder::dynamic()
+        .shape(Shape::Hull(hull))
+        .mass(3.0)
+        .build();
+    let i = b.world_inverse_inertia();
+    for axis in Vec3::AXES {
+        assert!((i * axis).distance(axis * 0.5) < 1e-12);
+    }
+}
+
+#[test]
+fn generated_hull_support_matches_original_point_cloud() {
+    use rust_physics::convex::{PrimitiveSupport, SupportMap};
+    use rust_physics::hull::RigidHull;
+    use std::sync::Arc;
+    let points: Vec<_> = (0..180)
+        .map(|i| {
+            let y = 1.0 - 2.0 * (f64::from(i) + 0.5) / 180.0;
+            let r = (1.0 - y * y).sqrt();
+            let angle = 2.3999632297 * f64::from(i);
+            Vec3::new(1.3 * r * angle.cos(), 0.7 * y, 1.8 * r * angle.sin())
+                + Vec3::new(2.0, 3.0, -1.0)
+        })
+        .collect();
+    let source = ConvexHull::new(points.clone()).unwrap();
+    let hull = Arc::new(RigidHull::from_points(points).unwrap());
+    let body = RigidBodyBuilder::static_body()
+        .position(hull.input_center())
+        .shape(Shape::Hull(hull))
+        .build();
+    let generated = PrimitiveSupport::new(&body).unwrap();
+    for i in 0..128 {
+        let t = f64::from(i);
+        let direction = Vec3::new(t.sin(), (0.29 * t).cos(), (0.83 * t).sin()).normalize();
+        assert!(
+            (source.support(direction).dot(direction)
+                - generated.support(direction).dot(direction))
+            .abs()
+                < 1e-10
+        );
+    }
+}
+
+#[test]
+fn hull_face_clipping_generates_a_supporting_contact_patch() {
+    use rust_physics::hull::RigidHull;
+    use std::sync::Arc;
+    let hull = Arc::new(RigidHull::from_points(cube().points().iter().copied()).unwrap());
+    let a = RigidBodyBuilder::static_body()
+        .shape(Shape::Hull(hull.clone()))
+        .build();
+    let b = RigidBodyBuilder::dynamic()
+        .shape(Shape::Hull(hull))
+        .position(Vec3::Y * 1.9)
+        .build();
+    let mut output = Vec::new();
+    contacts(&a, &b, &mut output);
+    assert_eq!(output.len(), 4, "{output:?}");
+    assert!(
+        output
+            .iter()
+            .all(|p| (p.depth - 0.1).abs() < 1e-8 && p.normal.distance(Vec3::Y) < 1e-8)
+    );
+}
+
+#[test]
+fn aligned_cylinder_caps_produce_contact_points_in_the_disk_lens() {
+    let a = RigidBodyBuilder::static_body()
+        .shape(Shape::cylinder(0.8, 0.4))
+        .build();
+    let b = RigidBodyBuilder::dynamic()
+        .shape(Shape::cylinder(0.7, 0.4))
+        .position(Vec3::new(0.35, 0.75, 0.0))
+        .build();
+    let mut output = Vec::new();
+    contacts(&a, &b, &mut output);
+    assert_eq!(output.len(), 4);
+    for c in output {
+        assert!((c.depth - 0.05).abs() < 1e-12 && c.normal == Vec3::Y);
+        let p = Vec3::new(c.point.x, 0.0, c.point.z);
+        assert!(p.length() <= 0.8 + 1e-12 && p.distance(Vec3::X * 0.35) <= 0.7 + 1e-12);
+    }
 }

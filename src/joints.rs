@@ -192,6 +192,17 @@ pub(crate) struct JointImpulse {
     impulse: f64,
 }
 
+impl JointImpulse {
+    pub(crate) fn reaction(self) -> (Vec3, Vec3) {
+        let impulse = self.axis * self.impulse;
+        if self.angular {
+            (Vec3::ZERO, impulse)
+        } else {
+            (impulse, Vec3::ZERO)
+        }
+    }
+}
+
 const FREE: [f64; 2] = [f64::NEG_INFINITY, f64::INFINITY];
 
 struct Rows<'a> {
@@ -381,11 +392,7 @@ pub(crate) fn prepare(joint: Joint, a: &RigidBody, b: &RigidBody, h: f64, out: &
 
 impl JointRow {
     pub(crate) fn reaction(&self) -> (Vec3, Vec3) {
-        let impulse = self.axis * self.impulse;
-        match self.jacobian {
-            Jacobian::Linear(_) => (impulse, Vec3::ZERO),
-            Jacobian::Angular => (Vec3::ZERO, impulse),
-        }
+        self.cache().reaction()
     }
 
     pub(crate) fn cache(&self) -> JointImpulse {

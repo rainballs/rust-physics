@@ -1,12 +1,15 @@
 //! Rigid convex polyhedra from closed, outward-oriented triangle surfaces.
-use crate::terrain::{TriangleMesh, triangle_normal};
+use crate::terrain::TriangleMesh;
 use crate::{Mat3, Vec3};
 use std::collections::BTreeMap;
+mod build;
+mod facets;
+use facets::Facet;
 
 #[derive(Debug, PartialEq)]
 pub struct RigidHull {
     surface: TriangleMesh,
-    planes: Box<[(Vec3, f64)]>,
+    facets: Box<[Facet]>,
     input_center: Vec3,
     inertia: Mat3,
 }
@@ -37,7 +40,6 @@ impl RigidHull {
         let mut volume = 0.0;
         let mut first = Vec3::ZERO;
         let mut second = Mat3::ZERO;
-        let mut planes = Vec::with_capacity(triangles.len());
         for &[a, b, c] in &triangles {
             let [x, y, z] = [*points.get(a)?, *points.get(b)?, *points.get(c)?];
             let n = (y - x).cross(z - x).try_normalize()?;
@@ -78,14 +80,13 @@ impl RigidHull {
             return None;
         }
         let vertices: Vec<_> = points.iter().map(|p| (p - center) * scale).collect();
-        for face in &triangles {
-            let triangle = face.map(|i| vertices[i]);
-            let normal = triangle_normal(triangle);
-            planes.push((normal, normal.dot(triangle[0])));
+        let facets = facets::build(&vertices, &triangles, scale);
+        if facets.len() < 4 {
+            return None;
         }
         Some(Self {
             surface: TriangleMesh::new(vertices, triangles)?,
-            planes: planes.into_boxed_slice(),
+            facets: facets.into_boxed_slice(),
             input_center,
             inertia,
         })
@@ -100,13 +101,22 @@ impl RigidHull {
         &self.surface
     }
 
+    pub(crate) fn support_face(&self, direction: Vec3) -> (Vec3, &[usize]) {
+        let facet = self
+            .facets
+            .iter()
+            .max_by(|a, b| a.normal.dot(direction).total_cmp(&b.normal.dot(direction)))
+            .expect("validated solid hull");
+        (facet.normal, &facet.polygon)
+    }
+
     pub(crate) fn inertia(&self, mass: f64) -> Mat3 {
         self.inertia * mass
     }
 
     pub(crate) fn project(&self, point: Vec3) -> (Vec3, Vec3, f64) {
         let (surface, normal, distance) = self.surface.project(point);
-        if distance > 0.0 && self.planes.iter().all(|&(n, d)| n.dot(point) <= d) {
+        if distance > 0.0 && self.facets.iter().all(|f| f.normal.dot(point) <= f.offset) {
             (surface, -normal, -distance)
         } else {
             (surface, normal, distance)
@@ -116,7 +126,8 @@ impl RigidHull {
     pub(crate) fn ray(&self, origin: Vec3, direction: Vec3) -> Option<(f64, Vec3)> {
         let mut near = (f64::NEG_INFINITY, Vec3::ZERO);
         let mut far = (f64::INFINITY, Vec3::ZERO);
-        for &(normal, offset) in &self.planes {
+        for facet in &self.facets {
+            let (normal, offset) = (facet.normal, facet.offset);
             let numerator = offset - normal.dot(origin);
             let denominator = normal.dot(direction);
             if denominator == 0.0 {

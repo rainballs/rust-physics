@@ -154,3 +154,38 @@ fn mutual_gravity_preserves_momentum_and_tracks_two_body_orbit() {
     }
     assert!(w.body(bodies[0]).unwrap().position().distance(-Vec3::X) < 0.006);
 }
+
+#[test]
+fn capsule_controller_climbs_low_step_and_stops_at_tall_wall() {
+    use rust_physics::character::CapsuleController;
+    let mut world = PhysicsWorld::new();
+    world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    let step = world.add_body(
+        RigidBodyBuilder::static_body()
+            .position(Vec3::new(1.5, 0.125, 0.0))
+            .shape(Shape::cuboid(Vec3::new(0.65, 0.125, 1.0)))
+            .build(),
+    );
+    let wall = world.add_body(
+        RigidBodyBuilder::static_body()
+            .position(Vec3::new(3.0, 1.0, 0.0))
+            .shape(Shape::cuboid(Vec3::new(0.1, 1.0, 1.0)))
+            .build(),
+    );
+    let controller = CapsuleController::default();
+    let filter = QueryFilter::default();
+    let start = Vec3::Y * 0.701;
+    let up = controller
+        .move_by(&world, start, Vec3::X * 1.6, filter)
+        .unwrap();
+    assert!(
+        up.position.distance(Vec3::new(1.6, 0.951, 0.0)) < 0.005,
+        "{up:?}"
+    );
+    assert_eq!(up.ground.unwrap().body, step);
+    let blocked = controller
+        .move_by(&world, up.position, Vec3::X * 2.0, filter)
+        .unwrap();
+    assert!(blocked.hits.iter().any(|hit| hit.body == wall));
+    assert!(blocked.position.x < 2.61);
+}

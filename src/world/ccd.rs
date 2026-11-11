@@ -24,26 +24,29 @@ enum ImpactGeometry {
 }
 
 impl PhysicsWorld {
+    fn convex_sweeps(&self) -> bool {
+        self.settings.ccd_convex || self.settings.ccd_moving_convex
+    }
+
     pub(super) fn advance_poses(&mut self, h: f64, start: f64) -> usize {
         self.ccd_targets.clear();
-        let sweep = self.settings.ccd
-            && self
-                .bodies
-                .iter()
-                .any(|(_, b)| sweeps(b, self.settings.ccd_convex));
+        let convex = self.convex_sweeps();
+        let sweep = self.settings.ccd && self.bodies.iter().any(|(_, b)| sweeps(b, convex));
         if !sweep {
             for (_, body) in &mut self.bodies {
                 body.integrate_pose(h);
             }
             return 0;
         }
-        let synchronized = self.settings.ccd_moving_spheres;
+        let moving_convex = self.settings.ccd_moving_convex;
+        let synchronized = self.settings.ccd_moving_spheres || moving_convex;
         self.ccd_targets
             .extend(self.bodies.iter().enumerate().filter_map(|(i, (_, b))| {
                 (b.enabled
                     && !b.sensor
                     && (b.kind == BodyKind::Static
-                        || (synchronized && matches!(b.shape, Shape::Sphere { .. }))))
+                        || (synchronized && matches!(b.shape, Shape::Sphere { .. }))
+                        || (moving_convex && crate::convex::PrimitiveSupport::new(b).is_some())))
                 .then_some(i)
             }));
         if synchronized {
@@ -56,11 +59,11 @@ impl PhysicsWorld {
             let mut remaining = h;
             for _ in 0..4 {
                 let Some(hit) = self.first_impact(i, remaining, false) else {
-                    advance_ccd_pose(&mut self.bodies[i].1, remaining, self.settings.ccd_convex);
+                    advance_ccd_pose(&mut self.bodies[i].1, remaining, convex);
                     remaining = 0.0;
                     break;
                 };
-                advance_ccd_pose(&mut self.bodies[i].1, hit.time, self.settings.ccd_convex);
+                advance_ccd_pose(&mut self.bodies[i].1, hit.time, convex);
                 remaining = (remaining - hit.time).max(0.0);
                 self.resolve_impact(hit, start + (h - remaining));
                 if remaining == 0.0 {
@@ -68,7 +71,7 @@ impl PhysicsWorld {
                 }
             }
             if remaining > 0.0 {
-                advance_ccd_pose(&mut self.bodies[i].1, remaining, self.settings.ccd_convex);
+                advance_ccd_pose(&mut self.bodies[i].1, remaining, convex);
                 fallbacks += 1;
             }
         }
@@ -76,6 +79,7 @@ impl PhysicsWorld {
     }
 
     fn advance_synchronized(&mut self, h: f64, start: f64) -> usize {
+        let convex = self.convex_sweeps();
         let mut remaining = h;
         for _ in 0..32 {
             let next = (0..self.bodies.len())
@@ -88,7 +92,7 @@ impl PhysicsWorld {
                 });
             let dt = next.as_ref().map_or(remaining, |hit| hit.time);
             for (_, body) in &mut self.bodies {
-                advance_ccd_pose(body, dt, self.settings.ccd_convex);
+                advance_ccd_pose(body, dt, convex);
             }
             remaining = (remaining - dt).max(0.0);
             if let Some(hit) = next {
@@ -102,14 +106,15 @@ impl PhysicsWorld {
         // the same time. Integrate the remainder before the discrete solve
         // so force integration and elapsed simulation time stay consistent.
         for (_, body) in &mut self.bodies {
-            advance_ccd_pose(body, remaining, self.settings.ccd_convex);
+            advance_ccd_pose(body, remaining, convex);
         }
         1
     }
 
     fn first_impact(&self, index: usize, dt: f64, synchronized: bool) -> Option<ImpactCandidate> {
         let (handle, body) = &self.bodies[index];
-        if !sweeps(body, self.settings.ccd_convex) {
+        let convex = self.convex_sweeps();
+        if !sweeps(body, convex) {
             return None;
         }
         let mut best: Option<ImpactCandidate> = None;
@@ -118,11 +123,21 @@ impl PhysicsWorld {
             if index == j || !compatible(body, target) {
                 continue;
             }
+            let target_moves = target.kind != BodyKind::Static;
+            let spheres = matches!(body.shape, Shape::Sphere { .. })
+                && matches!(target.shape, Shape::Sphere { .. });
+            let pair_sweeps = if spheres {
+                synchronized
+            } else {
+                self.settings.ccd_moving_convex
+            };
+            if target_moves && (!pair_sweeps || (sweeps(target, convex) && handle > other_handle)) {
+                continue;
+            }
             let max_time = best.as_ref().map_or(dt, |hit| hit.time);
-            let (time, contact) = if let Shape::Sphere { radius } = body.shape {
-                if synchronized && sweeps(target, false) && handle > other_handle {
-                    continue;
-                }
+            let (time, contact) = if let Shape::Sphere { radius } = body.shape
+                && (!target_moves || spheres)
+            {
                 let relative = body.velocity - target.velocity;
                 let Some(direction) = relative.try_normalize() else {
                     continue;
@@ -143,7 +158,13 @@ impl PhysicsWorld {
                 }
                 (distance / speed, ImpactGeometry::Sphere { radius, normal })
             } else {
-                if target.kind != BodyKind::Static {
+                if target_moves
+                    && target.kind == BodyKind::Dynamic
+                    && !sweeps(target, convex)
+                    && target.angular_velocity() != Vec3::ZERO
+                {
+                    // The unflagged target follows midpoint rotation rather
+                    // than the frozen-spin CCD path.
                     continue;
                 }
                 let Some(hit) = crate::motion::cast(body, target, max_time) else {

@@ -1,7 +1,7 @@
 //! Contact and joint preparation, impulse iterations, and island sleep state.
 use super::{
-    BodyHandle, BodyKind, Cached, Contact, Joint, JointBatch, JointBreakEvent, JointRow,
-    PhysicsWorld, RigidBody, Row, Settings, Shape, Vec3,
+    BodyHandle, BodyKind, Cached, Contact, ContactImpulse, Joint, JointBatch, JointBreakEvent,
+    JointRow, PhysicsWorld, RigidBody, Row, Settings, Shape, Vec3,
 };
 use crate::joints;
 use std::collections::BTreeMap;
@@ -196,6 +196,24 @@ impl PhysicsWorld {
                     self.bodies[i].1.wake();
                 }
             }
+        }
+    }
+
+    pub(super) fn record_contact_impulses(&mut self, time: f64) {
+        for m in &self.scratch.manifolds {
+            self.contact_impulses
+                .extend(
+                    self.scratch.rows[m.rows.clone()]
+                        .iter()
+                        .map(|row| ContactImpulse {
+                            bodies: [m.pair.0, m.pair.1],
+                            point: row.contact.point,
+                            normal: row.contact.normal,
+                            normal_impulse: row.cache.normal_impulse,
+                            tangential_impulse: row.cache.friction,
+                            time,
+                        }),
+                );
         }
     }
 

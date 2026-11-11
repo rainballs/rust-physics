@@ -218,9 +218,12 @@ fn capsule_contact_pairings_report_expected_depth_and_orientation() {
     contacts(&box_body, &capsule, &mut output);
     assert!(output.is_empty());
     contacts(&box_body, &side, &mut output);
-    assert_eq!(output.len(), 1);
-    assert!((output[0].depth - 0.25).abs() < 1e-12);
-    assert_eq!(output[0].normal, Vec3::X);
+    assert_eq!(output.len(), 2);
+    assert!(
+        output
+            .iter()
+            .all(|c| (c.depth - 0.25).abs() < 1e-12 && c.normal == Vec3::X)
+    );
     output.clear();
     contacts(&side, &box_body, &mut output);
     assert_eq!(output[0].normal, -Vec3::X);
@@ -470,4 +473,24 @@ fn convex_cast_handles_box_and_capsule_translation() {
         assert!((hit.position.x + 1.0).abs() < 1e-5);
         assert!(w.cast_shape(&query, Vec3::X, 1.0, filter).is_none());
     }
+}
+
+#[test]
+fn parallel_capsules_keep_contacts_at_both_ends_of_overlap() {
+    let a = RigidBodyBuilder::static_body()
+        .shape(Shape::capsule(0.4, 0.8))
+        .build();
+    let b = RigidBodyBuilder::dynamic()
+        .shape(Shape::capsule(0.3, 0.7))
+        .position(Vec3::new(0.6, 0.2, 0.0))
+        .build();
+    let mut contacts = Vec::new();
+    rust_physics::collision::contacts(&a, &b, &mut contacts);
+    assert_eq!(contacts.len(), 2);
+    assert!(
+        contacts
+            .iter()
+            .all(|c| c.normal.distance(Vec3::X) < 1e-12 && (c.depth - 0.1).abs() < 1e-12)
+    );
+    assert!((contacts[0].point.distance(contacts[1].point) - 1.3).abs() < 1e-12);
 }

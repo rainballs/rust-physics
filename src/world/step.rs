@@ -52,6 +52,7 @@ impl PhysicsWorld {
         self.events.clear();
         self.impacts.clear();
         self.joint_breaks.clear();
+        self.contact_impulses.clear();
         for substep in 0..self.settings.substeps {
             self.substep::<PROFILE, CHECKED>(h, h * substep as f64, &mut stats, &mut timings)?;
         }
@@ -145,6 +146,9 @@ impl PhysicsWorld {
         }
         self.prepare_solver(h);
         stats.solved_parallel_islands += self.solve_rows();
+        if self.settings.contact_impulse_reporting {
+            self.record_contact_impulses(start + h);
+        }
         self.cache_joint_impulses();
         self.finish_contacts();
         self.break_joints(h);

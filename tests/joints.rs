@@ -261,3 +261,26 @@ fn breakable_joint_reports_solved_reaction_and_releases_load() {
     assert!(w.joint(joint).is_none());
     assert!(w.body(load).unwrap().position().y < -1.0);
 }
+
+#[test]
+fn joint_reaction_reports_load_without_breaking_joint() {
+    let mut w = PhysicsWorld::new();
+    let anchor = w.add_body(RigidBodyBuilder::static_body().filter(1, 0).build());
+    let load = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(-Vec3::Y)
+            .mass(2.0)
+            .build(),
+    );
+    let joint = w
+        .add_joint(Joint::new(
+            [anchor, load],
+            [Vec3::ZERO; 2],
+            JointKind::Distance { length: 1.0 },
+        ))
+        .unwrap();
+    w.step_fixed().unwrap();
+    let reaction = w.joint_reaction(joint).unwrap();
+    assert!(reaction.force.distance(Vec3::Y * 19.62) < 1e-12);
+    assert_eq!(reaction.torque, Vec3::ZERO);
+}
