@@ -38,6 +38,7 @@ pub enum JointKind {
     Revolute {
         axes: [Vec3; 2],
         motor: Option<Motor>,
+        limits: Option<HingeLimits>,
     },
     /// Allows translation along the local axis of A and fixes relative rotation.
     Prismatic {
@@ -46,6 +47,28 @@ pub enum JointKind {
         limits: Option<[f64; 2]>,
         motor: Option<Motor>,
     },
+}
+
+/// Angular limits in radians, measured from A's local reference tangent
+/// to B's tangent about the common hinge axis. Bounds cannot cross ±π.
+#[derive(Clone, Copy, Debug)]
+pub struct HingeLimits {
+    pub tangents: [Vec3; 2],
+    pub angles: [f64; 2],
+}
+
+impl HingeLimits {
+    fn valid(self, axes: [Vec3; 2]) -> bool {
+        let [low, high] = self.angles;
+        low > -std::f64::consts::PI
+            && high < std::f64::consts::PI
+            && low <= high
+            && self
+                .tangents
+                .into_iter()
+                .zip(axes)
+                .all(|(t, axis)| t.is_normalized() && t.dot(axis).abs() < 1e-8)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,8 +116,14 @@ impl Joint {
                         && nonnegative(damping)
                 }
                 JointKind::Fixed { rotation } => unit_rotation(rotation),
-                JointKind::Revolute { axes, motor } => {
-                    axes.into_iter().all(unit_axis) && motor.is_none_or(Motor::valid)
+                JointKind::Revolute {
+                    axes,
+                    motor,
+                    limits,
+                } => {
+                    axes.into_iter().all(unit_axis)
+                        && motor.is_none_or(Motor::valid)
+                        && limits.is_none_or(|limits| limits.valid(axes))
                 }
                 JointKind::Prismatic {
                     axis,
@@ -221,7 +250,11 @@ pub(crate) fn prepare(joint: Joint, a: &RigidBody, b: &RigidBody, h: f64, out: &
             }
             match joint.kind {
                 JointKind::Fixed { rotation } => rows.fixed_rotation(rotation),
-                JointKind::Revolute { axes, motor } => {
+                JointKind::Revolute {
+                    axes,
+                    motor,
+                    limits,
+                } => {
                     let first = a.rotation * axes[0];
                     let second = b.rotation * axes[1];
                     let (u, v) = first.any_orthonormal_pair();
@@ -233,6 +266,24 @@ pub(crate) fn prepare(joint: Joint, a: &RigidBody, b: &RigidBody, h: f64, out: &
                     }
                     if let Some(motor) = motor {
                         rows.motor(first, Jacobian::Angular, motor);
+                    }
+                    if let Some(limits) = limits {
+                        let ta = a.rotation * limits.tangents[0];
+                        let tb = b.rotation * limits.tangents[1];
+                        let correction = if angle > 1e-10 {
+                            Quat::from_scaled_axis(-correction)
+                        } else {
+                            Quat::IDENTITY
+                        };
+                        let aligned = correction * tb;
+                        let twist = first.dot(ta.cross(aligned)).atan2(ta.dot(aligned));
+                        let [low, high] = limits.angles;
+                        if low == high {
+                            rows.rigid(first, Jacobian::Angular, twist - low);
+                        } else {
+                            rows.limit(first, Jacobian::Angular, twist - high);
+                            rows.limit(-first, Jacobian::Angular, low - twist);
+                        }
                     }
                 }
                 _ => {}

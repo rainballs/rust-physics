@@ -3,6 +3,8 @@
 
 pub mod body;
 pub mod collision;
+pub mod convex;
+pub mod debug;
 pub mod fluid;
 pub mod grid;
 pub mod integrators;
@@ -15,7 +17,7 @@ pub mod world;
 pub use body::{BodyKind, Material, RigidBody, RigidBodyBuilder, Shape};
 pub use glam::{DMat2 as Mat2, DMat3 as Mat3, DMat4 as Mat4, DQuat as Quat};
 pub use glam::{DVec2 as Vec2, DVec3 as Vec3, DVec4 as Vec4};
-pub use joints::{Joint, JointHandle, JointKind, Motor};
+pub use joints::{HingeLimits, Joint, JointHandle, JointKind, Motor};
 pub use world::{
-    BodyHandle, PhysicsWorld, QueryFilter, Ray, RayHit, Settings, StepError, StepStats,
+    BodyHandle, BroadPhase, PhysicsWorld, QueryFilter, Ray, RayHit, Settings, StepError, StepStats,
 };

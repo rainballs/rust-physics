@@ -1,4 +1,6 @@
-//! Narrow phase for spheres, oriented boxes, and infinite half-spaces.
+//! Narrow phase for spheres, capsules, oriented boxes, and infinite half-spaces.
+use crate::convex::{self, ConvexContact, PrimitiveSupport};
+use crate::spatial::{Aabb, box_intervals, project};
 use crate::{RigidBody, Shape, Vec3};
 
 /// A world-space contact. The normal points in the direction that separates
@@ -15,17 +17,7 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
     let start = out.len();
     match (a.shape, b.shape) {
         (Shape::Sphere { radius: ar }, Shape::Sphere { radius: br }) => {
-            let delta = b.position - a.position;
-            let d = delta.length();
-            let depth = ar + br - d;
-            if depth >= 0.0 {
-                let normal = delta.try_normalize().unwrap_or(Vec3::X);
-                out.push(Contact {
-                    point: a.position + normal * (ar - depth * 0.5),
-                    normal,
-                    depth,
-                });
-            }
+            rounded_points(a.position, b.position, ar, br, Vec3::X, out);
         }
         (Shape::Plane, Shape::Plane) => {}
         (Shape::Plane, _) => plane_shape(a, b, out),
@@ -33,13 +25,69 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
             plane_shape(b, a, out);
             flip(&mut out[start..]);
         }
-        (Shape::Cuboid { half_extents }, Shape::Sphere { radius }) => {
-            box_sphere(a, half_extents, b, radius, out);
+        (Shape::Cuboid { .. }, Shape::Sphere { radius }) => {
+            shape_sphere(a, b, radius, out);
         }
-        (Shape::Sphere { radius }, Shape::Cuboid { half_extents }) => {
-            box_sphere(b, half_extents, a, radius, out);
+        (Shape::Sphere { radius }, Shape::Cuboid { .. }) => {
+            shape_sphere(b, a, radius, out);
             flip(&mut out[start..]);
         }
+        (
+            Shape::Capsule {
+                radius: ar,
+                half_segment: ah,
+            },
+            Shape::Capsule {
+                radius: br,
+                half_segment: bh,
+            },
+        ) => {
+            let u = a.rotation * Vec3::Y;
+            let v = b.rotation * Vec3::Y;
+            let (p, q) = closest_segments(
+                a.position - u * ah,
+                u * (2.0 * ah),
+                b.position - v * bh,
+                v * (2.0 * bh),
+            );
+            let normal = u.cross(v).try_normalize().unwrap_or(a.rotation * Vec3::X);
+            rounded_points(p, q, ar, br, normal, out);
+        }
+        (Shape::Capsule { .. }, Shape::Sphere { radius }) => capsule_sphere(a, b, radius, out),
+        (Shape::Sphere { radius }, Shape::Capsule { .. }) => {
+            capsule_sphere(b, a, radius, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Cuboid { half_extents }, Shape::Capsule { .. }) => {
+            box_capsule(a, half_extents, b, out)
+        }
+        (Shape::Capsule { .. }, Shape::Cuboid { half_extents }) => {
+            box_capsule(b, half_extents, a, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Cylinder { .. }, Shape::Sphere { radius }) => shape_sphere(a, b, radius, out),
+        (Shape::Sphere { radius }, Shape::Cylinder { .. }) => {
+            shape_sphere(b, a, radius, out);
+            flip(&mut out[start..]);
+        }
+        (
+            Shape::Cylinder {
+                radius: ar,
+                half_height: ah,
+            },
+            Shape::Cylinder {
+                radius: br,
+                half_height: bh,
+            },
+        ) => {
+            let axis = a.rotation * Vec3::Y;
+            if axis.cross(b.rotation * Vec3::Y).length_squared() < 1e-20 {
+                parallel_cylinders(a.position, b.position, axis, [ar, br], [ah, bh], out);
+            } else {
+                convex_pair(a, b, out);
+            }
+        }
+        (Shape::Cylinder { .. }, _) | (_, Shape::Cylinder { .. }) => convex_pair(a, b, out),
         (Shape::Cuboid { half_extents: ah }, Shape::Cuboid { half_extents: bh }) => {
             box_box(Obb::new(a, ah), Obb::new(b, bh), out);
         }
@@ -74,30 +122,258 @@ fn plane_shape(plane: &RigidBody, body: &RigidBody, out: &mut Vec<Contact>) {
                 add(p);
             }
         }
+        Shape::Capsule {
+            radius,
+            half_segment,
+        } => {
+            let u = body.rotation * Vec3::Y * half_segment;
+            add(body.position - u - normal * radius);
+            if half_segment > 0.0 {
+                add(body.position + u - normal * radius);
+            }
+        }
+        Shape::Cylinder {
+            radius,
+            half_height,
+        } => {
+            let u = body.rotation * Vec3::Y;
+            let projection = normal.dot(u);
+            let cap = u * half_height;
+            let radial = -(normal - u * projection);
+            if radial.length_squared() < 1e-16 {
+                let (x, y) = u.any_orthonormal_pair();
+                let center = body.position - cap * projection.signum();
+                for side in [x, -x, y, -y] {
+                    add(center + side * radius);
+                }
+            } else {
+                let point = body.position + radial.normalize() * radius;
+                add(point - cap);
+                add(point + cap);
+            }
+        }
         Shape::Plane => {}
     }
 }
 
-fn box_sphere(cube: &RigidBody, h: Vec3, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
-    let center = cube.rotation.conjugate() * (sphere.position - cube.position);
-    let mut closest = center.clamp(-h, h);
-    let delta = center - closest;
-    let (local_normal, depth) = if let Some(normal) = delta.try_normalize() {
-        (normal, radius - delta.length())
+fn parallel_cylinders(
+    a: Vec3,
+    b: Vec3,
+    axis: Vec3,
+    [ar, br]: [f64; 2],
+    [ah, bh]: [f64; 2],
+    out: &mut Vec<Contact>,
+) {
+    let delta = b - a;
+    let axial = axis.dot(delta);
+    let lateral = delta - axis * axial;
+    let lateral_distance = lateral.length();
+    let cap_depth = ah + bh - axial.abs();
+    let side_depth = ar + br - lateral_distance;
+    if cap_depth < 0.0 || side_depth < 0.0 {
+        return;
+    }
+    let (point, normal, depth) = if cap_depth <= side_depth {
+        let n = axis * axial.signum();
+        let fraction = if lateral_distance > 0.0 {
+            let low = (lateral_distance - br).max(-ar);
+            let high = (lateral_distance + br).min(ar);
+            0.5 * (low + high) / lateral_distance
+        } else {
+            0.0
+        };
+        (
+            a + lateral * fraction + n * (ah - cap_depth * 0.5),
+            n,
+            cap_depth,
+        )
     } else {
-        let distances = h - center.abs();
-        let axis = min_axis(distances);
-        let normal = Vec3::AXES[axis] * center[axis].signum();
-        closest[axis] = normal[axis] * h[axis];
-        (normal, radius + distances[axis])
+        let n = lateral
+            .try_normalize()
+            .unwrap_or_else(|| axis.any_orthonormal_vector());
+        let low = (axial - bh).max(-ah);
+        let high = (axial + bh).min(ah);
+        (
+            a + axis * ((low + high) * 0.5) + n * (ar - side_depth * 0.5),
+            n,
+            side_depth,
+        )
     };
-    if depth >= 0.0 {
+    out.push(Contact {
+        point,
+        normal,
+        depth,
+    });
+}
+
+fn convex_pair(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
+    let [ab, bb] = [a, b].map(|b| Aabb::of(b).expect("finite convex shape"));
+    let scale = (ab.max - ab.min).max(bb.max - bb.min).max_element();
+    let a = PrimitiveSupport::new(a).expect("finite convex shape");
+    let b = PrimitiveSupport::new(b).expect("finite convex shape");
+    if let ConvexContact::Penetrating {
+        depth,
+        normal,
+        point_a,
+        point_b,
+    } = convex::query(&a, &b, scale * 1e-6)
+    {
         out.push(Contact {
-            point: cube.position + cube.rotation * (closest - local_normal * depth * 0.5),
-            normal: cube.rotation * local_normal,
+            point: (point_a + point_b) * 0.5,
+            normal,
             depth,
         });
     }
+}
+
+fn shape_sphere(cube: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
+    let (closest, normal, distance) = project(cube, sphere.position);
+    let depth = radius - distance;
+    if depth >= 0.0 {
+        out.push(Contact {
+            point: closest - normal * (depth * 0.5),
+            normal,
+            depth,
+        });
+    }
+}
+
+fn capsule_sphere(capsule: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
+    let Shape::Capsule {
+        radius: capsule_radius,
+        half_segment,
+    } = capsule.shape
+    else {
+        unreachable!()
+    };
+    let u = capsule.rotation * Vec3::Y;
+    let offset = (sphere.position - capsule.position)
+        .dot(u)
+        .clamp(-half_segment, half_segment);
+    rounded_points(
+        capsule.position + u * offset,
+        sphere.position,
+        capsule_radius,
+        radius,
+        capsule.rotation * Vec3::X,
+        out,
+    );
+}
+
+fn rounded_points(a: Vec3, b: Vec3, ar: f64, br: f64, fallback: Vec3, out: &mut Vec<Contact>) {
+    let delta = b - a;
+    let depth = ar + br - delta.length();
+    if depth >= 0.0 {
+        let normal = delta.try_normalize().unwrap_or(fallback);
+        out.push(Contact {
+            point: a + normal * (ar - depth * 0.5),
+            normal,
+            depth,
+        });
+    }
+}
+
+/// Closest pair on two finite segments, including zero-length segments.
+fn closest_segments(a: Vec3, u: Vec3, b: Vec3, v: Vec3) -> (Vec3, Vec3) {
+    let w = a - b;
+    let uu = u.length_squared();
+    let vv = v.length_squared();
+    let uv = u.dot(v);
+    let uw = u.dot(w);
+    let vw = v.dot(w);
+    let denominator = u.cross(v).length_squared();
+    let s = if denominator > uu * vv * 1e-16 {
+        ((uv * vw - vv * uw) / denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let t = if vv > 0.0 {
+        ((uv * s + vw) / vv).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let s = if uu > 0.0 {
+        ((uv * t - uw) / uu).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a + s * u, b + t * v)
+}
+
+fn box_capsule(cube: &RigidBody, h: Vec3, capsule: &RigidBody, out: &mut Vec<Contact>) {
+    let Shape::Capsule {
+        radius,
+        half_segment,
+    } = capsule.shape
+    else {
+        unreachable!()
+    };
+    let inverse = cube.rotation.conjugate();
+    let center = inverse * (capsule.position - cube.position);
+    let axis = inverse * (capsule.rotation * Vec3::Y);
+    let origin = center - axis * half_segment;
+    let segment = axis * (2.0 * half_segment);
+    let (boundaries, count) = box_intervals(origin, segment, h, 1.0);
+    let mut best = (f64::INFINITY, center, center);
+    for interval in boundaries[..count].windows(2) {
+        let [start, end] = [interval[0], interval[1]];
+        let sample = origin + segment * ((start + end) * 0.5);
+        let fixed = sample.abs().cmpgt(h);
+        let feature = sample.clamp(-h, h);
+        let delta = Vec3::select(fixed, origin - feature, Vec3::ZERO);
+        let motion = Vec3::select(fixed, segment, Vec3::ZERO);
+        let t = if motion == Vec3::ZERO {
+            (start + end) * 0.5
+        } else {
+            (-delta.dot(motion) / motion.length_squared()).clamp(start, end)
+        };
+        let p = origin + segment * t;
+        let q = p.clamp(-h, h);
+        let d2 = p.distance_squared(q);
+        if d2 < best.0 {
+            best = (d2, p, q);
+        }
+    }
+    let (d2, p, q) = best;
+    if d2 > radius * radius {
+        return;
+    }
+    let (depth, normal, point) = if let Some(n) = (p - q).try_normalize() {
+        let depth = radius - d2.sqrt();
+        (depth, n, q - n * depth * 0.5)
+    } else {
+        // Segment intersects the box. The configuration obstacle is a box
+        // extruded by the segment, then rounded by the capsule radius. From
+        // inside the polytope, the closest supporting face gives the exit.
+        let mut best = (f64::INFINITY, Vec3::X);
+        for direction in Vec3::AXES
+            .into_iter()
+            .chain(Vec3::AXES.map(|v| v.cross(axis)))
+        {
+            let Some(n) = direction.try_normalize() else {
+                continue;
+            };
+            let projection = center.dot(n);
+            let depth =
+                h.dot(n.abs()) + half_segment * axis.dot(n).abs() + radius - projection.abs();
+            if depth < best.0 {
+                best = (depth, n * projection.signum());
+            }
+        }
+        let (depth, n) = best;
+        let sign = if axis.dot(n).abs() < 1e-10 {
+            0.0
+        } else {
+            axis.dot(n).signum()
+        };
+        let feature = center - axis * (half_segment * sign) - n * radius;
+        (depth, n, feature + n * (depth * 0.5))
+    };
+    out.push(Contact {
+        point: cube.position + cube.rotation * point,
+        normal: cube.rotation * normal,
+        depth,
+    });
 }
 
 fn min_axis(v: Vec3) -> usize {
@@ -210,18 +486,9 @@ fn box_box(a: Obb, b: Obb, out: &mut Vec<Contact>) {
         Feature::Edges(i, j) => {
             let (a0, a1) = a.edge(i, normal);
             let (b0, b1) = b.edge(j, -normal);
-            let u = a1 - a0;
-            let v = b1 - b0;
-            let w = a0 - b0;
-            let uv = u.dot(v);
-            let uu = u.length_squared();
-            let vv = v.length_squared();
-            let denominator = u.cross(v).length_squared();
-            let s = ((uv * v.dot(w) - vv * u.dot(w)) / denominator).clamp(0.0, 1.0);
-            let t = ((uv * s + v.dot(w)) / vv).clamp(0.0, 1.0);
-            let s = ((uv * t - u.dot(w)) / uu).clamp(0.0, 1.0);
+            let (p, q) = closest_segments(a0, a1 - a0, b0, b1 - b0);
             out.push(Contact {
-                point: (a0 + s * u + b0 + t * v) * 0.5,
+                point: (p + q) * 0.5,
                 normal,
                 depth,
             });

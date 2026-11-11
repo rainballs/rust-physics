@@ -99,6 +99,7 @@ fn hinge_motor_rotates_around_axis_and_corrects_tilt() {
         [Vec3::ZERO; 2],
         JointKind::Revolute {
             axes: [Vec3::Y; 2],
+            limits: None,
             motor: Some(Motor {
                 speed: 2.0,
                 max_effort: 5.0,
@@ -159,4 +160,34 @@ fn fixed_joint_restores_pose() {
     let b = w.body(b).unwrap();
     assert!(b.position().distance(Vec3::X * 0.8) < 0.004);
     assert!(b.rotation().angle_between(Quat::IDENTITY) < 1e-6);
+}
+
+#[test]
+fn motor_stalls_at_angular_hinge_limit() {
+    let mut w = PhysicsWorld::new();
+    w.set_gravity(Vec3::ZERO).unwrap();
+    let a = w.add_body(RigidBodyBuilder::static_body().filter(1, 0).build());
+    let b = w.add_body(RigidBodyBuilder::dynamic().build());
+    w.add_joint(Joint::new(
+        [a, b],
+        [Vec3::ZERO; 2],
+        JointKind::Revolute {
+            axes: [Vec3::Y; 2],
+            motor: Some(Motor {
+                speed: 2.0,
+                max_effort: 5.0,
+            }),
+            limits: Some(rust_physics::HingeLimits {
+                tangents: [Vec3::X; 2],
+                angles: [-0.3, 0.4],
+            }),
+        },
+    ))
+    .unwrap();
+    for _ in 0..100 {
+        w.step_fixed().unwrap();
+    }
+    let b = w.body(b).unwrap();
+    assert!(b.angular_velocity().length() < 1e-8);
+    assert!(b.rotation().angle_between(Quat::from_rotation_y(0.4)) < 1e-6);
 }

@@ -172,3 +172,70 @@ fn raycasts_report_world_normals_and_stale_handles_stay_invalid() {
     assert_ne!(w.add_body(removed), id);
     assert!(w.body(id).is_none());
 }
+
+#[test]
+fn resting_island_wakes_when_support_is_removed() {
+    let mut world = PhysicsWorld::new();
+    let floor = world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    let bottom = world.add_body(RigidBodyBuilder::dynamic().position(Vec3::Y * 0.5).build());
+    let top = world.add_body(RigidBodyBuilder::dynamic().position(Vec3::Y * 1.5).build());
+    for _ in 0..120 {
+        world.step_fixed().unwrap();
+    }
+    assert!(world.body(bottom).unwrap().is_sleeping());
+    assert!(world.body(top).unwrap().is_sleeping());
+    world.remove_body(floor).unwrap();
+    for _ in 0..15 {
+        world.step_fixed().unwrap();
+    }
+    assert!(world.body(bottom).unwrap().position().y < 0.3);
+    assert!(world.body(top).unwrap().position().y < 1.3);
+}
+
+#[test]
+fn penetration_correction_recovers_a_sphere_inside_a_box() {
+    let mut w = PhysicsWorld::new();
+    w.set_gravity(Vec3::ZERO).unwrap();
+    w.add_body(
+        RigidBodyBuilder::static_body()
+            .shape(Shape::cuboid(Vec3::new(1.0, 2.0, 3.0)))
+            .build(),
+    );
+    let ball = w.add_body(RigidBodyBuilder::dynamic().build());
+    for _ in 0..40 {
+        w.step_fixed().unwrap();
+    }
+    let b = w.body(ball).unwrap();
+    assert!((b.position().x - 1.499).abs() < 1e-10);
+    assert_eq!(b.velocity(), Vec3::ZERO);
+}
+
+#[test]
+fn friction_holds_a_box_on_a_shallow_slope_and_slows_sliding() {
+    let mut w = PhysicsWorld::new();
+    let angle = 0.15;
+    let q = Quat::from_rotation_z(angle);
+    w.add_body(
+        RigidBodyBuilder::static_body()
+            .rotation(q)
+            .shape(Shape::Plane)
+            .build(),
+    );
+    let b = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(q * (Vec3::Y * 0.5))
+            .rotation(q)
+            .shape(Shape::cuboid(Vec3::splat(0.5)))
+            .build(),
+    );
+    for _ in 0..120 {
+        w.step_fixed().unwrap();
+    }
+    assert!((q.conjugate() * w.body(b).unwrap().position()).x.abs() < 0.04);
+    w.body_mut(b).unwrap().set_velocity(q * (-Vec3::X * 3.0));
+    for _ in 0..15 {
+        w.step_fixed().unwrap();
+    }
+    let b = w.body(b).unwrap();
+    assert!(b.velocity().dot(q * -Vec3::X) < 2.8);
+}

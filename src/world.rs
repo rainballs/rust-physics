@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::collision::{Contact, contacts};
 use crate::joints::{self, Joint, JointHandle, JointRow};
-use crate::spatial::{Aabb, project, ray_body, sweep_sphere};
+use crate::spatial::{Aabb, Bvh, Proxy, SpatialIndex, project, ray_body, sweep_sphere};
 use crate::{BodyKind, RigidBody, Shape, Vec3};
 
 static NEXT_WORLD: AtomicU64 = AtomicU64::new(1);
@@ -17,9 +17,17 @@ pub struct BodyHandle {
     serial: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BroadPhase {
+    #[default]
+    SweepAndPrune,
+    Bvh,
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub gravity: Vec3,
+    pub broad_phase: BroadPhase,
     pub fixed_dt: f64,
     pub substeps: usize,
     pub iterations: usize,
@@ -35,6 +43,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             gravity: Vec3::new(0.0, -9.81, 0.0),
+            broad_phase: BroadPhase::SweepAndPrune,
             fixed_dt: 1.0 / 60.0,
             substeps: 2,
             iterations: 12,
@@ -184,6 +193,8 @@ struct SolverScratch {
     next_impulses: Vec<Cached>,
     active: Vec<(Pair, bool)>,
     islands: Islands,
+    solver_degree: Vec<u8>,
+    coupled_manifolds: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -235,12 +246,6 @@ impl Islands {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Proxy {
-    index: usize,
-    bounds: Aabb,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidJoint;
 
@@ -265,6 +270,7 @@ pub struct PhysicsWorld {
     events: Vec<CollisionEvent>,
     debug_contacts: Vec<(BodyHandle, BodyHandle, Contact)>,
     proxies: Vec<Proxy>,
+    bvh: Bvh,
     planes: Vec<usize>,
     candidates: Vec<[usize; 2]>,
     ccd_targets: Vec<usize>,
@@ -295,6 +301,7 @@ impl PhysicsWorld {
             events: Vec::new(),
             debug_contacts: Vec::new(),
             proxies: Vec::new(),
+            bvh: Bvh::default(),
             planes: Vec::new(),
             candidates: Vec::new(),
             ccd_targets: Vec::new(),
@@ -356,6 +363,10 @@ impl PhysicsWorld {
         self.joints.get(&handle)
     }
 
+    pub fn joints(&self) -> impl ExactSizeIterator<Item = (JointHandle, &Joint)> {
+        self.joints.iter().map(|(&handle, joint)| (handle, joint))
+    }
+
     pub fn remove_joint(&mut self, handle: JointHandle) -> Option<Joint> {
         let joint = self.joints.remove(&handle)?;
         for body in joint.bodies {
@@ -415,6 +426,10 @@ impl PhysicsWorld {
     /// World-space contacts sampled before the final substep's penetration correction.
     pub fn debug_contacts(&self) -> &[(BodyHandle, BodyHandle, Contact)] {
         &self.debug_contacts
+    }
+
+    pub fn spatial_index(&self) -> SpatialIndex<'_> {
+        SpatialIndex::new(self)
     }
 
     pub fn raycast(
@@ -758,7 +773,27 @@ impl PhysicsWorld {
 
     fn solve_rows(&mut self) {
         let scratch = &mut self.scratch;
+        scratch.solver_degree.clear();
+        scratch.solver_degree.resize(self.bodies.len(), 0);
+        scratch.coupled_manifolds.clear();
+
+        // Independent manifolds can run all iterations while their body
+        // state and rows are still in cache. Shared static and kinematic
+        // endpoints carry no solver state and do not connect islands.
         for m in &scratch.manifolds {
+            if m.rows.is_empty() {
+                continue;
+            }
+            for i in m.indices {
+                scratch.solver_degree[i] = scratch.solver_degree[i].saturating_add(1);
+            }
+        }
+        for (indices, _) in &scratch.joint_batches {
+            for &i in indices {
+                scratch.solver_degree[i] = scratch.solver_degree[i].saturating_add(1);
+            }
+        }
+        for (index, m) in scratch.manifolds.iter().enumerate() {
             if m.rows.is_empty() {
                 continue;
             }
@@ -766,18 +801,31 @@ impl PhysicsWorld {
                 .bodies
                 .get_disjoint_mut(m.indices)
                 .expect("distinct pairs");
-            for row in &scratch.rows[m.rows.clone()] {
+            let rows = &mut scratch.rows[m.rows.clone()];
+            for row in &*rows {
                 let impulse = row.contact.normal * row.cache.normal_impulse + row.cache.friction;
                 apply(a, b, row.offsets, impulse);
+            }
+            let coupled = m
+                .indices
+                .into_iter()
+                .zip([&*a, &*b])
+                .any(|(i, body)| effective_mass(body) > 0.0 && scratch.solver_degree[i] > 1);
+            if coupled {
+                scratch.coupled_manifolds.push(index);
+            } else {
+                for _ in 0..self.settings.iterations {
+                    for row in &mut *rows {
+                        solve(a, b, row);
+                    }
+                }
             }
         }
         for _ in 0..self.settings.iterations {
             self.solve_joints();
             let scratch = &mut self.scratch;
-            for m in &scratch.manifolds {
-                if m.rows.is_empty() {
-                    continue;
-                }
+            for &index in &scratch.coupled_manifolds {
+                let m = &scratch.manifolds[index];
                 let [(_, a), (_, b)] = self
                     .bodies
                     .get_disjoint_mut(m.indices)
@@ -928,28 +976,47 @@ impl PhysicsWorld {
                 self.planes.push(index);
             }
         }
-        let extent = center_max - center_min;
-        let axis = if extent.x >= extent.y && extent.x >= extent.z {
-            0
-        } else if extent.y >= extent.z {
-            1
-        } else {
-            2
-        };
-        self.proxies.sort_unstable_by(|a, b| {
-            a.bounds.min[axis]
-                .total_cmp(&b.bounds.min[axis])
-                .then(a.index.cmp(&b.index))
-        });
-        for (i, a) in self.proxies.iter().enumerate() {
-            for b in &self.proxies[i + 1..] {
-                if b.bounds.min[axis] > a.bounds.max[axis] {
-                    break;
-                }
-                if a.bounds.intersects(b.bounds) {
-                    push_pair(&self.bodies, &mut self.candidates, a.index, b.index);
+        match self.settings.broad_phase {
+            BroadPhase::SweepAndPrune => {
+                let extent = center_max - center_min;
+                let axis = if extent.x >= extent.y && extent.x >= extent.z {
+                    0
+                } else if extent.y >= extent.z {
+                    1
+                } else {
+                    2
+                };
+                self.proxies.sort_unstable_by(|a, b| {
+                    a.bounds.min[axis]
+                        .total_cmp(&b.bounds.min[axis])
+                        .then(a.index.cmp(&b.index))
+                });
+                for (i, a) in self.proxies.iter().enumerate() {
+                    for b in &self.proxies[i + 1..] {
+                        if b.bounds.min[axis] > a.bounds.max[axis] {
+                            break;
+                        }
+                        if a.bounds.intersects(b.bounds) {
+                            push_pair(&self.bodies, &mut self.candidates, a.index, b.index);
+                        }
+                    }
                 }
             }
+            BroadPhase::Bvh => {
+                self.bvh.rebuild(&mut self.proxies);
+                for a in &self.proxies {
+                    self.bvh.visit(
+                        |b| a.bounds.intersects(b),
+                        |b| {
+                            if a.index < b {
+                                push_pair(&self.bodies, &mut self.candidates, a.index, b);
+                            }
+                        },
+                    );
+                }
+            }
+        }
+        for a in &self.proxies {
             for &plane in &self.planes {
                 let p = &self.bodies[plane].1;
                 let normal = p.rotation * Vec3::Y;
@@ -1160,15 +1227,21 @@ fn make_row(
 fn solve(a: &mut RigidBody, b: &mut RigidBody, row: &mut Row) {
     let n = row.contact.normal;
     let r = row.offsets;
-    let speed = relative_velocity(a, b, r).dot(n);
+    let mut velocity = relative_velocity(a, b, r);
+    let speed = velocity.dot(n);
     let old = row.cache.normal_impulse;
     let next = (old + (row.target_speed - speed) * row.normal_mass).max(0.0);
     row.cache.normal_impulse = next;
-    apply(a, b, r, n * (next - old));
+    if old != next {
+        apply(a, b, r, n * (next - old));
+        velocity = relative_velocity(a, b, r);
+    }
 
-    let velocity = relative_velocity(a, b, r);
     let slip = velocity - n * velocity.dot(n);
     let old = row.cache.friction;
+    if old == Vec3::ZERO && slip == Vec3::ZERO {
+        return;
+    }
     let mut candidate = old;
     if let Some(direction) = slip.try_normalize() {
         candidate -= slip / inverse_effective_mass(a, b, r, direction);

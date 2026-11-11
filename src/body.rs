@@ -14,6 +14,8 @@ pub enum BodyKind {
 pub enum Shape {
     Sphere { radius: f64 },
     Cuboid { half_extents: Vec3 },
+    Capsule { radius: f64, half_segment: f64 },
+    Cylinder { radius: f64, half_height: f64 },
     Plane,
 }
 
@@ -26,12 +28,41 @@ impl Shape {
         Self::Cuboid { half_extents }
     }
 
+    /// A local-Y line segment of length twice `half_segment`, swept by a sphere.
+    pub fn capsule(radius: f64, half_segment: f64) -> Self {
+        Self::Capsule {
+            radius,
+            half_segment,
+        }
+    }
+
+    /// A solid cylinder centered on the origin with its axis along local Y.
+    pub fn cylinder(radius: f64, half_height: f64) -> Self {
+        Self::Cylinder {
+            radius,
+            half_height,
+        }
+    }
+
     fn valid(self) -> bool {
         match self {
             Self::Sphere { radius } => radius.is_finite() && radius > 0.0,
             Self::Cuboid { half_extents } => {
                 half_extents.is_finite() && half_extents.min_element() > 0.0
             }
+            Self::Capsule {
+                radius,
+                half_segment,
+            } => {
+                radius.is_finite()
+                    && radius > 0.0
+                    && half_segment.is_finite()
+                    && half_segment >= 0.0
+            }
+            Self::Cylinder {
+                radius,
+                half_height,
+            } => radius.is_finite() && radius > 0.0 && half_height.is_finite() && half_height > 0.0,
             Self::Plane => true,
         }
     }
@@ -42,6 +73,25 @@ impl Shape {
             Self::Cuboid { half_extents: h } => {
                 let sq = h * h;
                 (sq.yzx() + sq.zxy()) * (mass / 3.0)
+            }
+            Self::Capsule {
+                radius: r,
+                half_segment: h,
+            } => {
+                let cylinder = mass * (h / (h + 2.0 * r / 3.0));
+                let caps = mass - cylinder;
+                let r2 = r * r;
+                let axial = (0.5 * cylinder + 0.4 * caps) * r2;
+                let transverse =
+                    cylinder * (0.25 * r2 + h * h / 3.0) + caps * (0.4 * r2 + h * h + 0.75 * h * r);
+                Vec3::new(transverse, axial, transverse)
+            }
+            Self::Cylinder {
+                radius: r,
+                half_height: h,
+            } => {
+                let transverse = mass * (r * r / 4.0 + h * h / 3.0);
+                Vec3::new(transverse, 0.5 * mass * r * r, transverse)
             }
             Self::Plane => Vec3::ZERO,
         }

@@ -17,6 +17,20 @@ impl Aabb {
                     + (body.rotation * Vec3::Y).abs() * h.y
                     + (body.rotation * Vec3::Z).abs() * h.z
             }
+            Shape::Capsule {
+                radius,
+                half_segment,
+            } => (body.rotation * Vec3::Y).abs() * half_segment + Vec3::splat(radius),
+            Shape::Cylinder {
+                radius,
+                half_height,
+            } => {
+                let u = body.rotation * Vec3::Y;
+                let v = body.rotation * Vec3::X;
+                let w = body.rotation * Vec3::Z;
+                u.abs() * half_height
+                    + Vec3::from_array((v * v + w * w).to_array().map(f64::sqrt)) * radius
+            }
             Shape::Plane => return None,
         };
         Some(Self {
@@ -34,16 +48,33 @@ pub(crate) fn ray_body(body: &RigidBody, origin: Vec3, direction: Vec3) -> Optio
     let relative = origin - body.position;
     match body.shape {
         Shape::Sphere { radius } => {
-            let b = relative.dot(direction);
-            let c = relative.length_squared() - radius * radius;
-            let discriminant = b * b - c;
-            if discriminant < 0.0 {
-                return None;
-            }
-            let near = -b - discriminant.sqrt();
-            let far = -b + discriminant.sqrt();
-            let t = if near >= 0.0 { near } else { far };
-            (t >= 0.0).then(|| (t, (relative + direction * t).normalize_or_zero()))
+            let t = sphere_roots(relative, direction, radius)?
+                .into_iter()
+                .filter(|&t| t >= 0.0)
+                .min_by(f64::total_cmp)?;
+            Some((t, (relative + direction * t).normalize_or_zero()))
+        }
+        Shape::Capsule {
+            radius,
+            half_segment,
+        } => {
+            let inverse = body.rotation.conjugate();
+            let (distance, normal) = ray_capsule(
+                inverse * relative,
+                inverse * direction,
+                radius,
+                half_segment,
+            )?;
+            Some((distance, body.rotation * normal))
+        }
+        Shape::Cylinder {
+            radius,
+            half_height,
+        } => {
+            let inverse = body.rotation.conjugate();
+            let (t, n) =
+                ray_cylinder(inverse * relative, inverse * direction, radius, half_height)?;
+            Some((t, body.rotation * n))
         }
         Shape::Plane => {
             let n = body.rotation * Vec3::Y;
@@ -97,6 +128,42 @@ pub(crate) fn project(body: &RigidBody, point: Vec3) -> (Vec3, Vec3, f64) {
                 normal,
                 offset.length() - radius,
             )
+        }
+        Shape::Capsule {
+            radius,
+            half_segment,
+        } => {
+            let axis = body.rotation * Vec3::Y;
+            let segment = axis * offset.dot(axis).clamp(-half_segment, half_segment);
+            let delta = offset - segment;
+            let normal = delta.try_normalize().unwrap_or(body.rotation * Vec3::X);
+            (
+                body.position + segment + normal * radius,
+                normal,
+                delta.length() - radius,
+            )
+        }
+        Shape::Cylinder {
+            radius,
+            half_height,
+        } => {
+            let local = body.rotation.conjugate() * offset;
+            let radial = Vec3::new(local.x, 0.0, local.z);
+            let radial_length = radial.length();
+            let u = radial.try_normalize().unwrap_or(Vec3::X);
+            let wall_gap = radial_length - radius;
+            let cap_gap = local.y.abs() - half_height;
+            let up = Vec3::Y * local.y.signum();
+            let (normal, distance) = if wall_gap > 0.0 || cap_gap > 0.0 {
+                let delta = u * wall_gap.max(0.0) + up * cap_gap.max(0.0);
+                (delta.normalize(), delta.length())
+            } else if wall_gap >= cap_gap {
+                (u, wall_gap)
+            } else {
+                (up, cap_gap)
+            };
+            let normal = body.rotation * normal;
+            (point - distance * normal, normal, distance)
         }
         Shape::Plane => {
             let normal = body.rotation * Vec3::Y;
@@ -152,6 +219,26 @@ pub(crate) fn sweep_sphere(
             let t = sphere_root(offset, direction, sum)?;
             (t, (offset + t * direction).try_normalize()?)
         }
+        Shape::Capsule {
+            radius: target_radius,
+            half_segment,
+        } => {
+            let inverse = body.rotation.conjugate();
+            let (t, normal) = ray_capsule(
+                inverse * offset,
+                inverse * direction,
+                radius + target_radius,
+                half_segment,
+            )?;
+            let normal = body.rotation * normal;
+            if direction.dot(normal) >= 0.0 {
+                return None;
+            }
+            (t, normal)
+        }
+        Shape::Cylinder { .. } => {
+            return conservative_sphere_cast(body, origin, direction, radius, max_distance);
+        }
         Shape::Cuboid { half_extents } => {
             let inverse = body.rotation.conjugate();
             let (t, normal) = rounded_box(
@@ -165,6 +252,121 @@ pub(crate) fn sweep_sphere(
         }
     };
     (distance.is_finite() && distance <= max_distance).then_some((distance, normal))
+}
+
+fn sphere_roots(offset: Vec3, direction: Vec3, radius: f64) -> Option<[f64; 2]> {
+    let a = direction.length_squared();
+    let b = offset.dot(direction);
+    let c = offset.length_squared() - radius * radius;
+    let discriminant = a * radius * radius - offset.cross(direction).length_squared();
+    if a <= 0.0 || discriminant < 0.0 {
+        return None;
+    }
+    let q = -b - b.signum() * discriminant.sqrt();
+    Some(if q == 0.0 {
+        [-b / a; 2]
+    } else {
+        [q / a, c / q]
+    })
+}
+
+fn ray_cylinder(o: Vec3, d: Vec3, radius: f64, h: f64) -> Option<(f64, Vec3)> {
+    let mut best = None;
+    let radial = Vec3::new(o.x, 0.0, o.z);
+    let radial_velocity = Vec3::new(d.x, 0.0, d.z);
+    if let Some(roots) = sphere_roots(radial, radial_velocity, radius) {
+        for t in roots {
+            if t >= 0.0
+                && (o.y + t * d.y).abs() <= h
+                && best.is_none_or(|(distance, _)| t < distance)
+            {
+                best = Some((t, (radial + t * radial_velocity).normalize_or_zero()));
+            }
+        }
+    }
+    if d.y != 0.0 {
+        for side in [-1.0, 1.0] {
+            let t = (h * side - o.y) / d.y;
+            if t >= 0.0
+                && (radial + t * radial_velocity).length_squared() <= radius * radius
+                && best.is_none_or(|(distance, _)| t < distance)
+            {
+                best = Some((t, Vec3::Y * side));
+            }
+        }
+    }
+    best
+}
+
+fn conservative_sphere_cast(
+    body: &RigidBody,
+    origin: Vec3,
+    direction: Vec3,
+    radius: f64,
+    max_distance: f64,
+) -> Option<(f64, Vec3)> {
+    let tolerance = radius * 1e-8;
+    let mut distance = 0.0;
+    for _ in 0..64 {
+        let (_, normal, surface_distance) = project(body, origin + direction * distance);
+        let gap = surface_distance - radius;
+        let approach = -normal.dot(direction);
+        if approach <= 0.0 || (distance == 0.0 && gap < -tolerance) {
+            return None;
+        }
+        if gap <= tolerance {
+            return Some((distance, normal));
+        }
+        distance += gap / approach;
+        if !distance.is_finite() || distance > max_distance {
+            return None;
+        }
+    }
+    None
+}
+
+fn ray_capsule(o: Vec3, d: Vec3, radius: f64, h: f64) -> Option<(f64, Vec3)> {
+    let mut best: Option<(f64, Vec3)> = None;
+    let mut consider = |offset: Vec3, direction: Vec3, valid: &dyn Fn(f64) -> bool| {
+        let Some(roots) = sphere_roots(offset, direction, radius) else {
+            return;
+        };
+        for t in roots {
+            if t >= 0.0 && valid(t) && best.is_none_or(|(distance, _)| t < distance) {
+                best = Some((t, (offset + direction * t).normalize_or_zero()));
+            }
+        }
+    };
+    consider(Vec3::new(o.x, 0.0, o.z), Vec3::new(d.x, 0.0, d.z), &|t| {
+        (o.y + t * d.y).abs() <= h
+    });
+    for side in [-1.0, 1.0] {
+        consider(o - Vec3::Y * (h * side), d, &|t| {
+            (o.y + t * d.y) * side >= h
+        });
+    }
+    best
+}
+
+/// Time values at which a line crosses any box coordinate plane.
+pub(crate) fn box_intervals(origin: Vec3, direction: Vec3, h: Vec3, end: f64) -> ([f64; 8], usize) {
+    let mut boundaries = [0.0; 8];
+    boundaries[1] = end;
+    let mut count = 2;
+    for axis in 0..3 {
+        if direction[axis] == 0.0 {
+            continue;
+        }
+        for sign in [-1.0, 1.0] {
+            let t = (sign * h[axis] - origin[axis]) / direction[axis];
+            if t > 0.0 && t < end {
+                boundaries[count] = t;
+                count += 1;
+            }
+        }
+    }
+    boundaries[..count].sort_unstable_by(f64::total_cmp);
+    (boundaries, count)
 }
 
 fn sphere_root(offset: Vec3, direction: Vec3, radius: f64) -> Option<f64> {
@@ -188,22 +390,7 @@ fn rounded_box(
 ) -> Option<(f64, Vec3)> {
     // Between crossings of the six box planes, the nearest feature is fixed.
     // On each interval, squared distance to that feature is a quadratic.
-    let mut boundaries = [0.0; 8];
-    boundaries[1] = max_distance;
-    let mut count = 2;
-    for axis in 0..3 {
-        if direction[axis] == 0.0 {
-            continue;
-        }
-        for sign in [-1.0, 1.0] {
-            let t = (sign * h[axis] - origin[axis]) / direction[axis];
-            if t > 0.0 && t < max_distance {
-                boundaries[count] = t;
-                count += 1;
-            }
-        }
-    }
-    boundaries[..count].sort_unstable_by(f64::total_cmp);
+    let (boundaries, count) = box_intervals(origin, direction, h, max_distance);
     for interval in boundaries[..count].windows(2) {
         let [start, end] = [interval[0], interval[1]];
         if start == end {
@@ -239,4 +426,227 @@ fn rounded_box(
         }
     }
     None
+}
+
+/// Flat median-split bounding volume hierarchy. Leaves refer to dense indices
+/// owned by the caller.
+#[derive(Default)]
+pub(crate) struct Bvh {
+    nodes: Vec<Node>,
+}
+
+struct Node {
+    bounds: Aabb,
+    kind: NodeKind,
+}
+
+enum NodeKind {
+    Leaf(usize),
+    Branch { right: usize },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Proxy {
+    pub index: usize,
+    pub bounds: Aabb,
+}
+
+impl Aabb {
+    fn center(self) -> Vec3 {
+        self.min * 0.5 + self.max * 0.5
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+
+    fn hit_ray(self, origin: Vec3, direction: Vec3, mut far: f64) -> bool {
+        let mut near: f64 = 0.0;
+        for axis in 0..3 {
+            if direction[axis] == 0.0 {
+                if origin[axis] < self.min[axis] || origin[axis] > self.max[axis] {
+                    return false;
+                }
+                continue;
+            }
+            let a = (self.min[axis] - origin[axis]) / direction[axis];
+            let b = (self.max[axis] - origin[axis]) / direction[axis];
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+            if near > far {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Bvh {
+    pub fn rebuild(&mut self, proxies: &mut [Proxy]) {
+        self.nodes.clear();
+        if !proxies.is_empty() {
+            self.build(proxies);
+        }
+    }
+
+    fn build(&mut self, proxies: &mut [Proxy]) -> usize {
+        let (first, rest) = proxies.split_first().expect("nonempty partition");
+        let index = self.nodes.len();
+        let bounds = rest
+            .iter()
+            .fold(first.bounds, |acc, proxy| acc.union(proxy.bounds));
+        self.nodes.push(Node {
+            bounds,
+            kind: NodeKind::Leaf(first.index),
+        });
+        if proxies.len() == 1 {
+            return index;
+        }
+        let mid = proxies.len() / 2;
+        let extent = bounds.max - bounds.min;
+        let axis = if extent.x >= extent.y && extent.x >= extent.z {
+            0
+        } else if extent.y >= extent.z {
+            1
+        } else {
+            2
+        };
+        proxies.select_nth_unstable_by(mid, |a, b| {
+            a.bounds.center()[axis]
+                .total_cmp(&b.bounds.center()[axis])
+                .then(a.index.cmp(&b.index))
+        });
+        let (left, right) = proxies.split_at_mut(mid);
+        self.build(left);
+        let right = self.build(right);
+        self.nodes[index].kind = NodeKind::Branch { right };
+        index
+    }
+
+    pub fn visit(
+        &self,
+        mut intersects: impl FnMut(Aabb) -> bool,
+        mut visit_leaf: impl FnMut(usize),
+    ) {
+        if !self.nodes.is_empty() {
+            self.visit_node(0, &mut intersects, &mut visit_leaf);
+        }
+    }
+
+    fn visit_node(
+        &self,
+        i: usize,
+        intersects: &mut impl FnMut(Aabb) -> bool,
+        visit_leaf: &mut impl FnMut(usize),
+    ) {
+        let node = &self.nodes[i];
+        if !intersects(node.bounds) {
+            return;
+        }
+        match node.kind {
+            NodeKind::Leaf(index) => visit_leaf(index),
+            NodeKind::Branch { right } => {
+                self.visit_node(i + 1, intersects, visit_leaf);
+                self.visit_node(right, intersects, visit_leaf);
+            }
+        }
+    }
+}
+
+use crate::{BodyHandle, PhysicsWorld, QueryFilter, Ray, RayHit};
+
+/// A reusable read-only acceleration snapshot for batches of world queries.
+/// It borrows the world so geometry stays current for the lifetime of the index.
+pub struct SpatialIndex<'a> {
+    world: &'a PhysicsWorld,
+    bodies: Vec<(BodyHandle, &'a RigidBody)>,
+    bvh: Bvh,
+    planes: Vec<usize>,
+}
+
+impl<'a> SpatialIndex<'a> {
+    pub(crate) fn new(world: &'a PhysicsWorld) -> Self {
+        let bodies: Vec<_> = world.bodies().collect();
+        let mut bvh = Bvh::default();
+        let mut proxies = Vec::with_capacity(bodies.len());
+        let mut planes = Vec::new();
+        for (index, &(_, body)) in bodies.iter().enumerate() {
+            if let Some(bounds) = Aabb::of(body) {
+                proxies.push(Proxy { index, bounds });
+            } else {
+                planes.push(index);
+            }
+        }
+        bvh.rebuild(&mut proxies);
+        Self {
+            world,
+            bodies,
+            bvh,
+            planes,
+        }
+    }
+
+    pub fn world(&self) -> &'a PhysicsWorld {
+        self.world
+    }
+
+    pub fn raycast(&self, ray: Ray, filter: QueryFilter) -> Option<RayHit> {
+        let direction = ray.direction.try_normalize()?;
+        if !ray.origin.is_finite() || ray.max_distance.is_nan() || ray.max_distance < 0.0 {
+            return None;
+        }
+        let mut best: Option<RayHit> = None;
+        let mut test = |index: usize| {
+            let (body, b) = self.bodies[index];
+            if !filter.accepts(body, b) {
+                return;
+            }
+            if let Some((distance, normal)) = ray_body(b, ray.origin, direction)
+                && distance.is_finite()
+                && distance <= ray.max_distance
+                && best.is_none_or(|hit| {
+                    distance < hit.distance || (distance == hit.distance && body < hit.body)
+                })
+            {
+                best = Some(RayHit {
+                    body,
+                    position: ray.origin + direction * distance,
+                    normal,
+                    distance,
+                });
+            }
+        };
+        self.bvh.visit(
+            |aabb| aabb.hit_ray(ray.origin, direction, ray.max_distance),
+            &mut test,
+        );
+        for &plane in &self.planes {
+            test(plane);
+        }
+        best
+    }
+
+    /// Writes intersecting finite collider AABBs in deterministic tree order.
+    pub fn query_aabb(&self, bounds: Aabb, filter: QueryFilter, mut visit: impl FnMut(BodyHandle)) {
+        self.bvh.visit(
+            |aabb| aabb.intersects(bounds),
+            |index| {
+                let (id, body) = self.bodies[index];
+                if filter.accepts(id, body) {
+                    visit(id);
+                }
+            },
+        );
+    }
+
+    pub fn raycast_batch<'b>(
+        &'b self,
+        rays: &'b [Ray],
+        filter: QueryFilter,
+    ) -> impl ExactSizeIterator<Item = Option<RayHit>> + 'b {
+        rays.iter().map(move |&ray| self.raycast(ray, filter))
+    }
 }
