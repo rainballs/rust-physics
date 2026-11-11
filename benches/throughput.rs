@@ -47,7 +47,12 @@ fn grid(side: i32, broad_phase: BroadPhase) -> PhysicsWorld {
 fn main() {
     println!("scenario,objects,samples,median_ms,p95_ms");
     for side in [10, 22, 37] {
-        for broad_phase in [BroadPhase::SweepAndPrune, BroadPhase::Bvh] {
+        for broad_phase in [
+            BroadPhase::SweepAndPrune,
+            BroadPhase::Bvh,
+            BroadPhase::UniformGrid,
+            BroadPhase::DynamicTree,
+        ] {
             let mut world = grid(side, broad_phase);
             let count = world.bodies().len();
             measure(&format!("{broad_phase:?} 3D grid"), count, || {
@@ -78,6 +83,44 @@ fn main() {
     measure("BVH index build", world.bodies().len(), || {
         black_box(world.spatial_index());
     });
+
+    #[cfg(feature = "rayon")]
+    for parallel_narrow_phase in [false, true] {
+        use rust_physics::Shape;
+        let mut world = PhysicsWorld::new();
+        world
+            .set_settings(Settings {
+                parallel_narrow_phase,
+                ..Default::default()
+            })
+            .unwrap();
+        for i in 0..1_000 {
+            let position = Vec3::X * (f64::from(i) * 4.0);
+            world.add_body(
+                RigidBodyBuilder::static_body()
+                    .position(position)
+                    .shape(Shape::cuboid(Vec3::ONE))
+                    .build(),
+            );
+            world.add_body(
+                RigidBodyBuilder::static_body()
+                    .sensor(true)
+                    .position(position + Vec3::X * 1.4)
+                    .shape(Shape::cylinder(0.5, 0.7))
+                    .build(),
+            );
+        }
+        let label = if parallel_narrow_phase {
+            "parallel mixed convex sensors"
+        } else {
+            "serial mixed convex sensors"
+        };
+        measure(label, 1_000, || {
+            let stats = world.step_fixed().unwrap();
+            assert_eq!(stats.contact_points, 2_000);
+            black_box(stats);
+        });
+    }
 
     for n in [10_000, 100_000, 1_000_000] {
         let mut aos = vec![

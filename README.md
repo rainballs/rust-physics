@@ -9,11 +9,13 @@ Use a Rust 2024 toolchain. The checked-in lockfile and all optional targets were
 ```sh
 cargo test --workspace --all-features
 cargo run --example drop
+cargo run --example deform
+cargo run --release --example stress -- 8 600
 cargo run --release --example sandbox --features macroquad
 cargo doc --workspace --no-deps
 ```
 
-The graphical example uses Macroquad and needs a working desktop and OpenGL context. In the sandbox, use **1–0** to select a scene, **Space** to pause, **N** to advance a paused frame, **R** to reset, **S/X** to spawn a sphere or box, and **G** to toggle rigid-body gravity. Right-drag orbits the view and the wheel zooms. **B/C/V** toggle bounds, contact normals, and velocities.
+The graphical example uses Macroquad and needs a working desktop and OpenGL context. In the sandbox, use **1–0** to select a scene, **Space** to pause, **N** to advance a paused frame, **R** to reset, **S/X** to spawn a sphere or box, and **G** to toggle rigid-body gravity. Right-drag orbits the view and the wheel zooms. **B/C/V/F/Q** toggle bounds, contact normals, velocities, forces, and centers of mass. **M** changes broad phase, and **P** switches the fluid tank between SPH and PBF.
 
 ## Rigid-body world
 
@@ -37,16 +39,16 @@ assert!(world.body(ball).unwrap().position().y >= 0.498);
 # Ok::<(), rust_physics::StepError>(())
 ```
 
-- Rigid bodies support static, kinematic, and dynamic motion, force and torque accumulation, world-space angular momentum, point impulses, gravity scaling, damping, and contact-island sleeping.
-- Primitive colliders include spheres, capsules, cylinders, cuboids, and half-spaces. The engine also supports weighted compounds, convex hulls from closed triangle surfaces, and static triangle meshes and heightfields. Mixed convex contacts can use experimental GJK/EPA. Contact response includes restitution, two-regime friction, cached impulses, and separate penetration correction. Layers, masks, and sensors control collision and overlap behavior.
-- Joint types include ball, distance, rope, damped spring, fixed, hinge, and slider. Hinges and sliders support effort-limited motors and limits.
-- Spatial queries include rays, batches, AABBs, sphere overlaps and casts, and nearest surfaces. Build a borrowed BVH with `world.spatial_index()` to accelerate repeated rays and AABB queries.
-- `softbody` implements XPBD cloth and tetrahedral volume constraints. `particles` implements seeded emitters, lifetimes, fields, optional Rayon updates, and rigid boundaries. `fluid` implements experimental weakly compressible SPH with symmetric pair forces and a spatial hash.
-- `character` implements sweep-and-slide sphere motion. `vehicle` applies raycast suspension and load-limited tire forces.
+- Rigid bodies support static, kinematic, and dynamic motion, force and torque accumulation, world-space angular momentum, point impulses, gravity scaling, damping, axis locks, origin rebasing, and contact-island sleeping. `PlanarWorld` provides a Vec2 API with circles, rectangles, half-planes, and solid-disk inertia. `planar_xy()` exposes the underlying axis locks.
+- Primitive colliders include spheres, capsules, cylinders, cuboids, and half-spaces. The engine also supports weighted compounds, convex hulls from closed triangle surfaces, and static triangle meshes and heightfields. Mixed convex contacts can use experimental GJK/EPA. Authored compounds can split into child bodies with inherited momentum. Contact response includes restitution, two-regime friction, cached impulses, and separate penetration correction. Layers, masks, and sensors control collision and overlap behavior.
+- Joint types include ball, distance, rope, damped spring, fixed, hinge, and slider. Hinges and sliders support effort-limited motors and limits. Joint and contact impulses warm-start across comparable substeps.
+- Spatial queries include rays, batches, AABBs, sphere overlaps, nearest surfaces, and translational convex casts. Build a borrowed BVH with `world.spatial_index()` for repeated queries. Broad-phase choices include sweep-and-prune, a rebuilt BVH, a uniform grid, and a persistent fat-AABB tree.
+- `softbody` implements XPBD cloth, tetrahedral volume constraints, and optional non-adjacent node collision. `particles` implements seeded emitters, lifetimes, fields, and equal-mass pair and rigid-boundary collisions. `fluid` implements experimental SPH and PBF, with optional two-way SPH boundary impulses. Rayon can parallelize independent particle motion and rigid narrow-phase work.
+- `character` implements sweep-and-slide sphere motion. `vehicle` applies raycast suspension and load-limited tire forces. `buoyancy` computes displaced volume and drag for partially submerged spheres.
 - `debug` streams renderer-independent lines. The sandbox renders ten scenes including stacks, a pendulum, a jointed ragdoll, cloth, particles, and a fluid tank.
 
 ## Current limits
 
-Convex pairs that depend on EPA may miss poorly conditioned contacts. Static meshes currently contact spheres, capsules, cuboids, and compounds with supported children. CCD sweeps dynamic spheres against static geometry, with optional synchronized sweeps against moving spheres. Other moving shape pairs use discrete contacts. Capsule pairs usually produce one contact, and the box solver uses translation-only penetration correction. Very stiff joints, extreme mass ratios, dense stacks, and extreme coordinate or timestep scales need further validation. Rigid solving is serial. Soft and fluid boundary coupling is one-way and discrete, and cloth has no self-collision.
+Convex pairs that depend on EPA may miss poorly conditioned contacts. Static mesh contacts for cylinders and hulls use experimental GJK/EPA per triangle. CCD sweeps fast dynamic spheres against static geometry, with optional synchronized sweeps against moving spheres. It reports budget exhaustion and completes the remaining time discretely. Other moving shape pairs use discrete contacts. Capsule pairs usually produce one contact, and contact position correction translates bodies without rotating them. Very stiff joints, extreme mass ratios, dense stacks, and extreme coordinate or timestep scales need further validation. Rigid constraint solving is serial. Cloth self-collision approximates vertices as spheres. Fluid and cloth boundary contacts are discrete, and PBF and cloth boundaries are one-way.
 
 See [architecture](ARCHITECTURE.md), [physics theory](PHYSICS_THEORY.md), [performance](PERFORMANCE.md), [roadmap](ROADMAP.md), and the [development checkpoint](DEVELOPMENT_STATE.md).

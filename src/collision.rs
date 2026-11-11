@@ -1,12 +1,12 @@
 //! Narrow phase for spheres, capsules, oriented boxes, and infinite half-spaces.
-use crate::convex::{self, ConvexContact, PrimitiveSupport};
+use crate::convex::{self, ConvexContact, PrimitiveSupport, TriangleSupport};
 use crate::spatial::{Aabb, box_intervals, project};
-use crate::terrain::{TriangleMesh, closest_triangle, triangle_normal};
+use crate::terrain::{TriangleMesh, closest_triangle, inside_triangle, triangle_normal};
 use crate::{RigidBody, Shape, Vec3};
 
 /// A world-space contact. The normal points in the direction that separates
 /// the second body from the first.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Contact {
     pub point: Vec3,
     pub normal: Vec3,
@@ -16,6 +16,7 @@ pub struct Contact {
 /// Emits the current overlap manifold into a caller-owned vector.
 pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
     let start = out.len();
+    let planar = planar_pair(a, b);
     match (&a.shape, &b.shape) {
         (Shape::Compound(compound), _) => compound_contacts(a, compound, b, out),
         (_, Shape::Compound(compound)) => {
@@ -51,6 +52,13 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
             Shape::Mesh(mesh),
         ) => {
             mesh_capsule(b, mesh, a, *radius, *half_segment, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Mesh(mesh), Shape::Cylinder { .. } | Shape::Hull(_)) => {
+            mesh_convex(a, mesh, b, out)
+        }
+        (Shape::Cylinder { .. } | Shape::Hull(_), Shape::Mesh(mesh)) => {
+            mesh_convex(b, mesh, a, out);
             flip(&mut out[start..]);
         }
         (Shape::Mesh(_), _) | (_, Shape::Mesh(_)) => {}
@@ -133,9 +141,23 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
         }
         (Shape::Cylinder { .. }, _) | (_, Shape::Cylinder { .. }) => convex_pair(a, b, out),
         (Shape::Cuboid { half_extents: ah }, Shape::Cuboid { half_extents: bh }) => {
-            box_box(Obb::new(a, *ah), Obb::new(b, *bh), out);
+            box_box(Obb::new(a, *ah), Obb::new(b, *bh), planar, out);
         }
     }
+    if planar && out.len() > start {
+        for contact in &mut out[start..] {
+            contact.point.z = a.position.z;
+        }
+        reduce_contacts(out, start);
+    }
+}
+
+fn planar_pair(a: &RigidBody, b: &RigidBody) -> bool {
+    [a, b].into_iter().all(|body| {
+        body.linear_axes == Vec3::new(1.0, 1.0, 0.0)
+            && body.angular_axes == Vec3::Z
+            && (body.rotation * Vec3::Z).distance_squared(Vec3::Z) < 1e-20
+    }) && a.position.z == b.position.z
 }
 
 fn flip(contacts: &mut [Contact]) {
@@ -180,23 +202,7 @@ fn plane_shape(plane: &RigidBody, body: &RigidBody, out: &mut Vec<Contact>) {
         Shape::Cylinder {
             radius,
             half_height,
-        } => {
-            let u = body.rotation * Vec3::Y;
-            let projection = normal.dot(u);
-            let cap = u * half_height;
-            let radial = -(normal - u * projection);
-            if radial.length_squared() < 1e-16 {
-                let (x, y) = u.any_orthonormal_pair();
-                let center = body.position - cap * projection.signum();
-                for side in [x, -x, y, -y] {
-                    add(center + side * radius);
-                }
-            } else {
-                let point = body.position + radial.normalize() * radius;
-                add(point - cap);
-                add(point + cap);
-            }
-        }
+        } => cylinder_plane_points(body, normal, radius, half_height, add),
         Shape::Hull(ref hull) => {
             for &vertex in hull.surface().vertices() {
                 add(body.position + body.rotation * vertex);
@@ -246,6 +252,68 @@ fn reduce_contacts(out: &mut Vec<Contact>, start: usize) {
         }
     }
     out.truncate(count);
+}
+
+fn mesh_convex(terrain: &RigidBody, mesh: &TriangleMesh, body: &RigidBody, out: &mut Vec<Contact>) {
+    let inverse = terrain.rotation.conjugate();
+    let mut local = body.clone();
+    local.position = inverse * (body.position - terrain.position);
+    local.rotation = inverse * body.rotation;
+    let bounds = Aabb::of(&local).expect("finite convex bounds");
+    let shape = PrimitiveSupport::new(&local).expect("finite convex support");
+    let tolerance = (bounds.max - bounds.min).max_element() * 1e-6;
+    let start = out.len();
+    let mut add = |point: Vec3, normal: Vec3, depth| {
+        out.push(Contact {
+            point: terrain.position + terrain.rotation * point,
+            normal: terrain.rotation * normal,
+            depth,
+        });
+    };
+    mesh.visit_triangles(bounds, |triangle| {
+        let ConvexContact::Penetrating {
+            depth,
+            normal,
+            point_a,
+            point_b,
+        } = convex::query(&TriangleSupport(triangle), &shape, tolerance)
+        else {
+            return;
+        };
+
+        // When the separating axis is the triangle face normal, expand the
+        // single EPA witness using penetrating feature points on the face.
+        let facet = triangle_normal(triangle);
+        let mut contributed = false;
+        if normal.dot(facet).abs() > 1.0 - 1e-6 {
+            let normal = facet * normal.dot(facet).signum();
+            let mut sample = |p: Vec3| {
+                let signed = (p - triangle[0]).dot(normal);
+                if signed <= 0.0 && inside_triangle(p - normal * signed, triangle, facet) {
+                    add(p - normal * (signed * 0.5), normal, -signed);
+                    contributed = true;
+                }
+            };
+            match &local.shape {
+                Shape::Cylinder {
+                    radius,
+                    half_height,
+                } => {
+                    cylinder_plane_points(&local, normal, *radius, *half_height, sample);
+                }
+                Shape::Hull(hull) => {
+                    for &vertex in hull.surface().vertices() {
+                        sample(local.position + local.rotation * vertex);
+                    }
+                }
+                _ => unreachable!("supported mesh convex geometry"),
+            }
+        }
+        if !contributed {
+            add((point_a + point_b) * 0.5, normal, depth);
+        }
+    });
+    reduce_contacts(out, start);
 }
 
 fn mesh_sphere(
@@ -525,8 +593,38 @@ fn convex_pair(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
     }
 }
 
+fn cylinder_plane_points(
+    body: &RigidBody,
+    normal: Vec3,
+    radius: f64,
+    half_height: f64,
+    mut add: impl FnMut(Vec3),
+) {
+    let axis = body.rotation * Vec3::Y;
+    let projection = normal.dot(axis);
+    let cap = axis * half_height;
+    let radial = -(normal - axis * projection);
+    if radial.length_squared() < 1e-16 {
+        let (x, y) = axis.any_orthonormal_pair();
+        let center = body.position - cap * projection.signum();
+        for side in [x, -x, y, -y] {
+            add(center + side * radius);
+        }
+    } else {
+        let point = body.position + radial.normalize() * radius;
+        add(point - cap);
+        add(point + cap);
+    }
+}
+
 fn shape_sphere(cube: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
-    let (closest, normal, distance) = project(cube, sphere.position);
+    let (closest, normal, distance) = if planar_pair(cube, sphere)
+        && let Shape::Cuboid { half_extents } = cube.shape
+    {
+        project_planar_box(cube, half_extents, sphere.position)
+    } else {
+        project(cube, sphere.position)
+    };
     let depth = radius - distance;
     if depth >= 0.0 {
         out.push(Contact {
@@ -535,6 +633,27 @@ fn shape_sphere(cube: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec
             depth,
         });
     }
+}
+
+fn project_planar_box(cube: &RigidBody, h: Vec3, center: Vec3) -> (Vec3, Vec3, f64) {
+    let p = cube.rotation.conjugate() * (center - cube.position);
+    let mut closest = p.clamp(-h, h);
+    closest.z = 0.0;
+    let delta = p - closest;
+    let (normal, distance) = if let Some(normal) = delta.try_normalize() {
+        (normal, delta.length())
+    } else {
+        let gaps = h - p.abs();
+        let axis = usize::from(gaps.y < gaps.x);
+        let normal = Vec3::AXES[axis] * p[axis].signum();
+        closest[axis] = normal[axis] * h[axis];
+        (normal, -gaps[axis])
+    };
+    (
+        cube.position + cube.rotation * closest,
+        cube.rotation * normal,
+        distance,
+    )
 }
 
 fn capsule_sphere(capsule: &RigidBody, sphere: &RigidBody, radius: f64, out: &mut Vec<Contact>) {
@@ -747,7 +866,7 @@ enum Feature {
     Edges(usize, usize),
 }
 
-fn box_box(a: Obb, b: Obb, out: &mut Vec<Contact>) {
+fn box_box(a: Obb, b: Obb, planar: bool, out: &mut Vec<Contact>) {
     let delta = b.center - a.center;
     let mut best = (f64::INFINITY, Vec3::X, Feature::FaceA(0));
     let mut test = |axis: Vec3, feature: Feature| {
@@ -766,15 +885,17 @@ fn box_box(a: Obb, b: Obb, out: &mut Vec<Contact>) {
         }
         true
     };
-    for i in 0..3 {
+    for i in 0..if planar { 2 } else { 3 } {
         if !test(a.axes[i], Feature::FaceA(i)) || !test(b.axes[i], Feature::FaceB(i)) {
             return;
         }
     }
-    for i in 0..3 {
-        for j in 0..3 {
-            if !test(a.axes[i].cross(b.axes[j]), Feature::Edges(i, j)) {
-                return;
+    if !planar {
+        for i in 0..3 {
+            for j in 0..3 {
+                if !test(a.axes[i].cross(b.axes[j]), Feature::Edges(i, j)) {
+                    return;
+                }
             }
         }
     }

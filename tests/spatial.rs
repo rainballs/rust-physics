@@ -264,3 +264,210 @@ fn cylinder_ray_and_sphere_cast_distinguish_cap_rim_and_side() {
     assert!((hit.distance - 1.7).abs() < 1e-7);
     assert!(hit.position.distance(Vec3::new(1.0, 0.5, 0.0)) < 1e-7);
 }
+
+#[test]
+#[cfg(feature = "rayon")]
+fn parallel_narrow_phase_preserves_order_and_solver_state() {
+    let build = |parallel_narrow_phase| {
+        let mut world = PhysicsWorld::new();
+        world
+            .set_settings(rust_physics::Settings {
+                parallel_narrow_phase,
+                ..Default::default()
+            })
+            .unwrap();
+        world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+        for i in 0..160 {
+            world.add_body(
+                RigidBodyBuilder::dynamic()
+                    .position(Vec3::new(f64::from(i) * 2.0, 0.5, 0.0))
+                    .build(),
+            );
+        }
+        world
+    };
+    let (mut a, mut b) = (build(false), build(true));
+    for _ in 0..30 {
+        assert_eq!(
+            a.step_fixed().unwrap().contact_points,
+            b.step_fixed().unwrap().contact_points
+        );
+        let geometry = |world: &PhysicsWorld| {
+            world
+                .debug_contacts()
+                .iter()
+                .map(|(_, _, c)| (c.point, c.normal, c.depth))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(geometry(&a), geometry(&b));
+        for ((_, a), (_, b)) in a.bodies().zip(b.bodies()) {
+            assert_eq!(
+                (a.position(), a.velocity(), a.rotation()),
+                (b.position(), b.velocity(), b.rotation())
+            );
+        }
+    }
+}
+
+#[test]
+fn grid_broad_phase_handles_touching_cells_and_oversized_shapes_without_duplicates() {
+    use rust_physics::{BroadPhase, Settings};
+    let run = |broad_phase| {
+        let mut world = PhysicsWorld::new();
+        world
+            .set_settings(Settings {
+                broad_phase,
+                grid_cell_size: 0.25,
+                gravity: Vec3::ZERO,
+                ..Default::default()
+            })
+            .unwrap();
+        world.add_body(
+            RigidBodyBuilder::static_body()
+                .shape(Shape::cuboid(Vec3::new(100.0, 0.2, 100.0)))
+                .build(),
+        );
+        for i in -5..=5 {
+            world.add_body(
+                RigidBodyBuilder::dynamic()
+                    .position(Vec3::new(f64::from(i), 0.7, 0.0))
+                    .build(),
+            );
+        }
+        let stats = world.step_fixed().unwrap();
+        (stats.candidate_pairs, stats.contact_points)
+    };
+    assert_eq!(run(BroadPhase::UniformGrid), run(BroadPhase::SweepAndPrune));
+}
+
+#[test]
+fn dynamic_tree_matches_rebuilt_bvh_across_motion_removal_and_insertion() {
+    use rust_physics::{BroadPhase, Settings};
+    let build = |broad_phase| {
+        let mut w = PhysicsWorld::new();
+        w.set_settings(Settings {
+            broad_phase,
+            gravity: Vec3::ZERO,
+            ..Default::default()
+        })
+        .unwrap();
+        let ids = (0..100)
+            .map(|i| {
+                let t = f64::from(i);
+                w.add_body(
+                    RigidBodyBuilder::kinematic()
+                        .sensor(true)
+                        .position(
+                            Vec3::new((t * 1.4).sin(), (t * 0.7).cos(), (t * 0.35).sin()) * 3.0,
+                        )
+                        .velocity(
+                            Vec3::new((t * 0.3).sin(), (t * 0.5).cos(), (t * 0.8).cos()) * 2.0,
+                        )
+                        .build(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (w, ids)
+    };
+    let (mut a, mut b) = (build(BroadPhase::Bvh), build(BroadPhase::DynamicTree));
+    for frame in 0..120 {
+        if frame % 8 == 0 {
+            for (world, ids) in [&mut a, &mut b] {
+                let i = frame / 8;
+                world.remove_body(ids[i]).unwrap();
+                ids[i] = world.add_body(
+                    RigidBodyBuilder::kinematic()
+                        .sensor(true)
+                        .position(Vec3::X * i as f64 * 0.1)
+                        .velocity(Vec3::Z)
+                        .build(),
+                );
+            }
+        }
+        let sa = a.0.step_fixed().unwrap();
+        let sb = b.0.step_fixed().unwrap();
+        assert_eq!(
+            (sa.candidate_pairs, sa.contact_points),
+            (sb.candidate_pairs, sb.contact_points),
+            "{frame}"
+        );
+        assert_eq!(a.0.events().len(), b.0.events().len());
+    }
+}
+
+#[test]
+fn indexed_sphere_and_nearest_queries_match_direct_geometry() {
+    let mut world = PhysicsWorld::new();
+    world.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    for i in -5..=5 {
+        world.add_body(
+            RigidBodyBuilder::static_body()
+                .position(Vec3::new(f64::from(i) * 2.0, 2.0, 0.0))
+                .rotation(Quat::from_rotation_z(f64::from(i) * 0.1))
+                .shape(Shape::capsule(0.4, 0.7))
+                .build(),
+        );
+    }
+    let index = world.spatial_index();
+    for i in -20..=20 {
+        let p = Vec3::new(f64::from(i) * 0.4, 3.0, 0.2);
+        let filter = QueryFilter::default();
+        let direct = world.cast_sphere(p, 0.3, -Vec3::Y, 5.0, filter).unwrap();
+        let indexed = index.cast_sphere(p, 0.3, -Vec3::Y, 5.0, filter).unwrap();
+        assert_eq!(
+            (direct.body, direct.distance, direct.position),
+            (indexed.body, indexed.distance, indexed.position)
+        );
+        let direct = world.nearest_surface(p, filter).unwrap();
+        let indexed = index.nearest_surface(p, filter).unwrap();
+        assert_eq!(
+            (direct.body, direct.distance),
+            (indexed.body, indexed.distance)
+        );
+        let mut overlaps = Vec::new();
+        index.overlap_sphere(p, 0.8, filter, |id| overlaps.push(id));
+        overlaps.sort_unstable();
+        assert_eq!(
+            overlaps,
+            world.overlap_sphere(p, 0.8, filter).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn distant_sphere_ray_retains_sub_radius_impact_parameter() {
+    let mut w = PhysicsWorld::new();
+    w.add_body(RigidBodyBuilder::static_body().build());
+    let origin = Vec3::new(-1e8, 0.25, 0.0);
+    let hit = w
+        .raycast(origin, Vec3::X, f64::INFINITY, QueryFilter::default())
+        .unwrap();
+    assert!((hit.position.x + 0.1875_f64.sqrt()).abs() < 2e-8);
+    assert!((hit.normal.y - 0.5).abs() < 2e-8);
+}
+
+#[test]
+fn convex_cast_handles_box_and_capsule_translation() {
+    let mut w = PhysicsWorld::new();
+    let id = w.add_body(
+        RigidBodyBuilder::static_body()
+            .shape(Shape::cuboid(Vec3::ONE))
+            .build(),
+    );
+    let filter = QueryFilter::default();
+    for (shape, width) in [
+        (Shape::cuboid(Vec3::splat(0.6)), 0.6),
+        (Shape::capsule(0.4, 0.8), 0.4),
+    ] {
+        let query = RigidBodyBuilder::kinematic()
+            .shape(shape)
+            .position(-Vec3::X * 5.0)
+            .build();
+        let hit = w.cast_shape(&query, Vec3::X, 6.0, filter).unwrap();
+        assert_eq!(hit.body, id);
+        assert!((hit.distance - (4.0 - width)).abs() < 2e-6, "{hit:?}");
+        assert!(hit.normal.distance(-Vec3::X) < 1e-5);
+        assert!((hit.position.x + 1.0).abs() < 1e-5);
+        assert!(w.cast_shape(&query, Vec3::X, 1.0, filter).is_none());
+    }
+}

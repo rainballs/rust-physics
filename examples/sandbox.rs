@@ -1,12 +1,16 @@
 use macroquad::prelude::*;
+use rust_physics::compound::{ColliderPart, Compound};
 use rust_physics::debug::{self, DebugOptions, LineKind};
-use rust_physics::fluid::{Fluid, FluidSettings};
+use rust_physics::fluid::{Fluid, FluidSettings, PbfFluid, PbfSettings};
+use rust_physics::hull::RigidHull;
 use rust_physics::particles::{Emitter, Particle, ParticleSettings, Particles};
 use rust_physics::softbody::{SoftBody, SoftSettings};
+use rust_physics::terrain::TriangleMesh;
 use rust_physics::{
-    Joint, JointKind, Material, PhysicsWorld, Quat, RigidBodyBuilder, Shape, StepStats,
+    BroadPhase, Joint, JointKind, Material, PhysicsWorld, Quat, RigidBodyBuilder, Shape, StepStats,
     Vec3 as DVec3,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 const DT: f64 = 1.0 / 60.0;
@@ -16,10 +20,10 @@ const SCENES: [&str; 10] = [
     "Dominoes",
     "Pendulum",
     "Jointed ragdoll",
-    "Rotated cuboids",
+    "Convex shapes and terrain",
     "Cloth",
     "Particle fountain",
-    "SPH tank",
+    "Fluid tank",
     "Stress test",
 ];
 const KEYS: [KeyCode; 10] = [
@@ -39,7 +43,47 @@ struct Scene {
     world: PhysicsWorld,
     cloth: Option<SoftBody>,
     particles: Option<(Particles, Emitter)>,
-    fluid: Option<Fluid>,
+    fluid: Option<Tank>,
+}
+
+enum Tank {
+    Sph(Fluid),
+    Pbf(PbfFluid),
+}
+
+impl Tank {
+    fn positions(&self) -> &[DVec3] {
+        match self {
+            Self::Sph(fluid) => fluid.positions(),
+            Self::Pbf(fluid) => fluid.positions(),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Sph(_) => "SPH",
+            Self::Pbf(_) => "PBF",
+        }
+    }
+
+    fn switch(&mut self) {
+        *self = match self {
+            Self::Sph(current) => {
+                let mut next = PbfFluid::new(PbfSettings::default()).unwrap();
+                for (&p, &v) in current.positions().iter().zip(current.velocities()) {
+                    next.push(p, v);
+                }
+                Self::Pbf(next)
+            }
+            Self::Pbf(current) => {
+                let mut next = Fluid::new(FluidSettings::default()).unwrap();
+                for (&p, &v) in current.positions().iter().zip(current.velocities()) {
+                    next.push(p, v);
+                }
+                Self::Sph(next)
+            }
+        };
+    }
 }
 
 impl Scene {
@@ -119,23 +163,7 @@ impl Scene {
                 .unwrap();
             }
             4 => ragdoll(w),
-            5 => {
-                for i in 0..16 {
-                    w.add_body(
-                        RigidBodyBuilder::dynamic()
-                            .position(DVec3::new((i % 4) as f64 - 1.5, 1.0 + 0.4 * i as f64, 0.0))
-                            .rotation(Quat::from_euler(
-                                ::glam::EulerRot::XYZ,
-                                i as f64 * 0.17,
-                                i as f64 * 0.13,
-                                0.4,
-                            ))
-                            .angular_velocity(DVec3::new(1.0, -0.5, 0.4))
-                            .shape(Shape::cuboid(DVec3::new(0.36, 0.62, 0.31)))
-                            .build(),
-                    );
-                }
-            }
+            5 => terrain_scene(w),
             6 => {
                 w.add_body(
                     RigidBodyBuilder::static_body()
@@ -173,7 +201,7 @@ impl Scene {
                         }
                     }
                 }
-                scene.fluid = Some(fluid);
+                scene.fluid = Some(Tank::Sph(fluid));
             }
             _ => {
                 for x in -20..20 {
@@ -225,12 +253,80 @@ impl Scene {
             particles.step(DT, settings, &[]);
             particles.collide(&self.world, filter, settings);
         }
-        if let Some(fluid) = &mut self.fluid {
-            for _ in 0..4 {
-                fluid.step(DT / 4.0, Some((&self.world, filter)));
+        match &mut self.fluid {
+            Some(Tank::Sph(fluid)) => {
+                for _ in 0..4 {
+                    fluid.step(DT / 4.0, Some((&self.world, filter)));
+                }
             }
+            Some(Tank::Pbf(fluid)) => {
+                for _ in 0..2 {
+                    fluid.step(DT * 0.5, Some((&self.world, filter)));
+                }
+            }
+            None => {}
         }
         stats
+    }
+}
+
+fn terrain_scene(world: &mut PhysicsWorld) {
+    let heights: Vec<_> = (0..81)
+        .map(|i| {
+            let x = f64::from(i % 9) - 4.0;
+            let z = f64::from(i / 9) - 4.0;
+            0.12 + 0.55 * (-0.15 * (x * x + z * z)).exp()
+        })
+        .collect();
+    let mesh = Arc::new(TriangleMesh::heightfield([9, 9], [0.7, 0.7], &heights).unwrap());
+    world.add_body(
+        RigidBodyBuilder::static_body()
+            .position(DVec3::new(-2.8, 0.0, -2.8))
+            .shape(Shape::Mesh(mesh))
+            .build(),
+    );
+    let tetra = Arc::new(
+        RigidHull::new(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z],
+            vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        )
+        .unwrap(),
+    );
+    let parts = [-0.4, 0.4]
+        .map(|x| ColliderPart {
+            shape: Shape::sphere(0.24),
+            position: DVec3::X * x,
+            rotation: Quat::IDENTITY,
+            weight: 1.0,
+        })
+        .to_vec();
+    let compound = Arc::new(Compound::new(parts).unwrap());
+    let shapes = [
+        Shape::sphere(0.4),
+        Shape::capsule(0.25, 0.4),
+        Shape::cuboid(DVec3::new(0.34, 0.46, 0.29)),
+        Shape::cylinder(0.32, 0.36),
+        Shape::Hull(tetra),
+        Shape::Compound(compound),
+    ];
+    for i in 0..18 {
+        world.add_body(
+            RigidBodyBuilder::dynamic()
+                .position(DVec3::new(
+                    (i % 6) as f64 * 0.75 - 1.9,
+                    1.1 + 0.3 * i as f64,
+                    (i / 6) as f64 - 1.0,
+                ))
+                .rotation(Quat::from_euler(
+                    ::glam::EulerRot::XYZ,
+                    i as f64 * 0.17,
+                    i as f64 * 0.13,
+                    0.4,
+                ))
+                .angular_velocity(DVec3::new(1.0, -0.5, 0.4))
+                .shape(shapes[i % shapes.len()].clone())
+                .build(),
+        );
     }
 }
 
@@ -333,13 +429,29 @@ async fn main() {
     let mut last_step = 0.0;
     let mut previous_mouse = mouse_position();
     let smoke = std::env::var_os("RUST_PHYSICS_SMOKE").is_some();
+    let smoke_steps = std::env::var("RUST_PHYSICS_SMOKE_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
     let mut smoke_scene = 0;
 
     loop {
         if smoke {
             index = smoke_scene;
             scene = Scene::new(index);
-            accumulator = DT;
+            accumulator = 0.0;
+            let start = Instant::now();
+            for _ in 0..smoke_steps {
+                stats = scene.step();
+            }
+            last_step = start.elapsed().as_secs_f64() * 1000.0 / smoke_steps.max(1) as f64;
+            if let Some(fluid) = &mut scene.fluid {
+                assert!(fluid.positions().iter().all(|p| p.is_finite()));
+                fluid.switch();
+                for _ in 0..smoke_steps {
+                    stats = scene.step();
+                }
+            }
         }
         if is_key_pressed(KeyCode::Escape) {
             break;
@@ -364,6 +476,28 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::V) {
             options.velocities = !options.velocities;
+        }
+        if is_key_pressed(KeyCode::F) {
+            options.forces = !options.forces;
+        }
+        if is_key_pressed(KeyCode::Q) {
+            options.centers = !options.centers;
+        }
+        if is_key_pressed(KeyCode::P)
+            && let Some(fluid) = &mut scene.fluid
+        {
+            fluid.switch();
+        }
+        if is_key_pressed(KeyCode::M) {
+            let broad_phase = match scene.world.settings().broad_phase {
+                BroadPhase::SweepAndPrune => BroadPhase::Bvh,
+                BroadPhase::Bvh => BroadPhase::UniformGrid,
+                BroadPhase::UniformGrid => BroadPhase::DynamicTree,
+                BroadPhase::DynamicTree => BroadPhase::SweepAndPrune,
+            };
+            let mut settings = scene.world.settings().clone();
+            settings.broad_phase = broad_phase;
+            scene.world.set_settings(settings).unwrap();
         }
         if is_key_pressed(KeyCode::G) {
             let gravity = if scene.world.settings().gravity == DVec3::ZERO {
@@ -430,8 +564,9 @@ async fn main() {
             Color::from_rgba(16, 24, 32, 232),
         );
         let state = if paused { "Paused" } else { "Running" };
+        let solver = scene.fluid.as_ref().map_or("", |fluid| fluid.name());
         draw_text(
-            format!("{}   |   {state}", SCENES[index]),
+            format!("{}   |   {state}   {solver}", SCENES[index]),
             16.0,
             30.0,
             26.0,
@@ -458,7 +593,7 @@ async fn main() {
             WHITE,
         );
         draw_text(
-            "Right-drag orbit   Wheel zoom   B bounds   C contacts   V velocity   Esc exit",
+            "Right-drag orbit   Wheel zoom   B bounds   C contacts   V velocity   M broad phase   P fluid",
             16.0,
             98.0,
             17.0,
@@ -467,7 +602,25 @@ async fn main() {
         next_frame().await;
         if smoke {
             assert!(scene.world.bodies().all(|(_, b)| b.position().is_finite()));
-            println!("rendered {}", SCENES[index]);
+            assert!(
+                scene
+                    .cloth
+                    .as_ref()
+                    .is_none_or(|cloth| cloth.positions().all(|p| p.is_finite()))
+            );
+            assert!(
+                scene
+                    .particles
+                    .as_ref()
+                    .is_none_or(|(pool, _)| pool.positions().iter().all(|p| p.is_finite()))
+            );
+            assert!(
+                scene
+                    .fluid
+                    .as_ref()
+                    .is_none_or(|fluid| fluid.positions().iter().all(|p| p.is_finite()))
+            );
+            println!("simulated and rendered {}", SCENES[index]);
             smoke_scene += 1;
             if smoke_scene == SCENES.len() {
                 break;

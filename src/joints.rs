@@ -157,6 +157,13 @@ pub(crate) struct JointRow {
     bounds: [f64; 2],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct JointImpulse {
+    axis: Vec3,
+    angular: bool,
+    impulse: f64,
+}
+
 const FREE: [f64; 2] = [f64::NEG_INFINITY, f64::INFINITY];
 
 struct Rows<'a> {
@@ -345,6 +352,29 @@ pub(crate) fn prepare(joint: Joint, a: &RigidBody, b: &RigidBody, h: f64, out: &
 }
 
 impl JointRow {
+    pub(crate) fn cache(&self) -> JointImpulse {
+        JointImpulse {
+            axis: self.axis,
+            angular: matches!(self.jacobian, Jacobian::Angular),
+            impulse: self.impulse,
+        }
+    }
+
+    pub(crate) fn warm_start(
+        &mut self,
+        previous: JointImpulse,
+        ratio: f64,
+        a: &mut RigidBody,
+        b: &mut RigidBody,
+    ) {
+        let agreement = self.axis.dot(previous.axis);
+        if previous.angular == matches!(self.jacobian, Jacobian::Angular) && agreement > 0.98 {
+            self.impulse =
+                (previous.impulse * ratio * agreement).clamp(self.bounds[0], self.bounds[1]);
+            self.apply(a, b, self.impulse);
+        }
+    }
+
     pub(crate) fn solve(&mut self, a: &mut RigidBody, b: &mut RigidBody) {
         let speed = match self.jacobian {
             Jacobian::Linear(r) => relative_velocity(a, b, r),
@@ -354,7 +384,14 @@ impl JointRow {
         let old = self.impulse;
         self.impulse = (old - (speed + self.bias + self.softness * old) * self.inverse_mass)
             .clamp(self.bounds[0], self.bounds[1]);
-        let impulse = self.axis * (self.impulse - old);
+        self.apply(a, b, self.impulse - old);
+    }
+
+    fn apply(&self, a: &mut RigidBody, b: &mut RigidBody, amount: f64) {
+        if amount == 0.0 {
+            return;
+        }
+        let impulse = self.axis * amount;
         match self.jacobian {
             Jacobian::Linear([ra, rb]) => {
                 a.solver_impulse(-impulse, ra);
@@ -362,10 +399,10 @@ impl JointRow {
             }
             Jacobian::Angular => {
                 if effective_mass(a) > 0.0 {
-                    a.angular_momentum -= impulse;
+                    a.angular_momentum -= impulse * a.angular_axes;
                 }
                 if effective_mass(b) > 0.0 {
-                    b.angular_momentum += impulse;
+                    b.angular_momentum += impulse * b.angular_axes;
                 }
             }
         }

@@ -6,6 +6,17 @@ pub trait SupportMap {
     fn support(&self, direction: Vec3) -> Vec3;
 }
 
+pub(crate) struct TriangleSupport(pub [Vec3; 3]);
+
+impl SupportMap for TriangleSupport {
+    fn support(&self, direction: Vec3) -> Vec3 {
+        self.0
+            .into_iter()
+            .max_by(|a, b| a.dot(direction).total_cmp(&b.dot(direction)))
+            .expect("three vertices")
+    }
+}
+
 /// Convex hull represented by its input points. Interior points are accepted
 /// and contribute to search cost. No face or edge mesh is generated.
 #[derive(Clone, Debug)]
@@ -393,12 +404,7 @@ impl Face {
                     .total_cmp(&b.point.distance_squared(target))
             })
             .expect("selected face is present");
-        let (a, b) = vertices
-            .iter()
-            .zip(closest.weights)
-            .fold((Vec3::ZERO, Vec3::ZERO), |(a, b), (point, weight)| {
-                (a + point.a * weight, b + point.b * weight)
-            });
+        let (a, b) = witnesses(&vertices, closest.weights);
         ConvexContact::Penetrating {
             normal: self.normal,
             depth: self.distance,
@@ -467,4 +473,148 @@ fn epa(
         );
     }
     ConvexContact::Indeterminate
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConvexDistance {
+    Separated {
+        distance: f64,
+        /// Unit direction from the nearest witness on A to the witness on B.
+        normal: Vec3,
+        point_a: Vec3,
+        point_b: Vec3,
+    },
+    Intersecting,
+    Indeterminate,
+}
+
+/// Measures separation between support maps using closest-simplex GJK.
+/// Distances within tolerance are classified as intersecting.
+pub fn distance(a: &impl SupportMap, b: &impl SupportMap, tolerance: f64) -> ConvexDistance {
+    use ConvexDistance::*;
+    if !tolerance.is_finite() || tolerance <= 0.0 {
+        return Indeterminate;
+    }
+    let support = |direction| Vertex {
+        a: a.support(direction),
+        b: b.support(-direction),
+    };
+    let mut simplex = [Vertex::default(); 4];
+    simplex[0] = support(Vec3::X);
+    let mut count = 1;
+    for _ in 0..64 {
+        let closest = closest_simplex(&simplex[..count]);
+        let distance = closest.point.length();
+        if distance <= tolerance {
+            return Intersecting;
+        }
+        if !distance.is_finite() {
+            return Indeterminate;
+        }
+        let normal = -closest.point / distance;
+        let next = support(normal);
+        let value = next.delta().dot(normal);
+        if !value.is_finite() {
+            return Indeterminate;
+        }
+        if value + distance <= tolerance
+            || simplex[..count]
+                .iter()
+                .any(|p| p.delta().distance_squared(next.delta()) <= tolerance * tolerance)
+        {
+            let (point_a, point_b) = witnesses(&simplex[..count], closest.weights);
+            return Separated {
+                distance,
+                normal,
+                point_a,
+                point_b,
+            };
+        }
+        let old = simplex;
+        count = 0;
+        for (i, weight) in closest.weights.into_iter().enumerate() {
+            if weight > 0.0 {
+                simplex[count] = old[i];
+                count += 1;
+            }
+        }
+        if count == 4 {
+            return Indeterminate;
+        }
+        simplex[count] = next;
+        count += 1;
+    }
+    Indeterminate
+}
+
+fn witnesses(vertices: &[Vertex], weights: [f64; 4]) -> (Vec3, Vec3) {
+    vertices
+        .iter()
+        .zip(weights)
+        .fold((Vec3::ZERO, Vec3::ZERO), |(a, b), (point, weight)| {
+            (a + point.a * weight, b + point.b * weight)
+        })
+}
+
+/// Conservative advancement under translation of B relative to A. Rotation
+/// and relative acceleration remain fixed for the duration of the cast.
+pub(crate) fn cast_translation(
+    a: &impl SupportMap,
+    b: &impl SupportMap,
+    direction: Vec3,
+    max: f64,
+    tolerance: f64,
+) -> Option<(f64, Vec3, Vec3)> {
+    let mut travel = 0.0;
+    let mut last = None;
+    for _ in 0..64 {
+        let translated = Transformed {
+            shape: b,
+            position: direction * travel,
+            rotation: Quat::IDENTITY,
+        };
+        match distance(a, &translated, tolerance * 0.1) {
+            ConvexDistance::Separated {
+                distance,
+                normal,
+                point_a,
+                ..
+            } => {
+                if distance <= tolerance {
+                    return Some((travel, normal, point_a));
+                }
+                let speed = -normal.dot(direction);
+                if speed <= 0.0 {
+                    return None;
+                }
+                let step = (distance - tolerance * 0.25) / speed;
+                let next = travel + step;
+                if !next.is_finite() || next > max {
+                    return None;
+                }
+                last = Some((normal, point_a));
+                if next == travel {
+                    return None;
+                }
+                travel = next;
+            }
+            ConvexDistance::Intersecting => {
+                if let Some((normal, point)) = last {
+                    return Some((travel, normal, point));
+                }
+                return match query(a, &translated, tolerance) {
+                    ConvexContact::Penetrating {
+                        normal, point_a, ..
+                    } => Some((0.0, normal, point_a)),
+                    ConvexContact::Touching => {
+                        let normal = -direction;
+                        Some((0.0, normal, a.support(normal)))
+                    }
+                    _ => None,
+                };
+            }
+            ConvexDistance::Indeterminate => return None,
+        }
+    }
+    None
 }

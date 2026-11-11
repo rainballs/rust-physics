@@ -143,3 +143,117 @@ fn sph_pair_forces_conserve_linear_momentum_and_repulse() {
     assert!(a.y < 1.0 && b.y > -1.0);
     assert_eq!(fluid.densities()[0], fluid.densities()[1]);
 }
+
+#[test]
+fn soft_body_self_contact_separates_unlinked_nodes_and_respects_pins() {
+    let mut body = SoftBody::default();
+    let a = body.push_node(Vec3::ZERO, 0.0).unwrap();
+    let b = body.push_node(Vec3::ZERO, 1.0).unwrap();
+    let c = body.push_node(Vec3::X, 1.0).unwrap();
+    let d = body.push_node(Vec3::X * 1.05, 1.0).unwrap();
+    assert!(body.add_distance([c, d], 0.0));
+    let settings = SoftSettings {
+        gravity: Vec3::ZERO,
+        self_collision_distance: Some(0.1),
+        ..Default::default()
+    };
+    assert!(body.step(1.0 / 60.0, settings, None));
+    assert_eq!(body.position(a), Some(Vec3::ZERO));
+    assert!((body.position(b).unwrap().length() - 0.1).abs() < 1e-12);
+    assert!(
+        (body
+            .position(c)
+            .unwrap()
+            .distance(body.position(d).unwrap())
+            - 0.05)
+            .abs()
+            < 1e-12
+    );
+}
+
+#[test]
+fn pbf_projection_reduces_compression_without_center_drift() {
+    use rust_physics::fluid::{PbfFluid, PbfSettings};
+    let mut fluid = PbfFluid::new(PbfSettings {
+        gravity: Vec3::ZERO,
+        rest_density: 280.0,
+        viscosity: 0.0,
+        ..Default::default()
+    })
+    .unwrap();
+    fluid.push(Vec3::X * -0.06, Vec3::ZERO);
+    fluid.push(Vec3::X * 0.06, Vec3::ZERO);
+    fluid.step(0.01, None);
+    let [a, b] = [fluid.positions()[0], fluid.positions()[1]];
+    assert!((a + b).length() < 1e-12);
+    assert!(a.distance(b) > 0.12);
+    assert!(fluid.densities().iter().all(|&rho| rho <= 280.1));
+}
+
+#[test]
+fn pbf_floor_boundary_keeps_particles_above_surface() {
+    use rust_physics::fluid::{PbfFluid, PbfSettings};
+    let mut w = PhysicsWorld::new();
+    w.add_body(RigidBodyBuilder::static_body().shape(Shape::Plane).build());
+    let settings = PbfSettings::default();
+    let mut fluid = PbfFluid::new(settings).unwrap();
+    for x in 0..3 {
+        for z in 0..3 {
+            fluid.push(
+                Vec3::new(f64::from(x) * 0.16, 0.3, f64::from(z) * 0.16),
+                Vec3::ZERO,
+            );
+        }
+    }
+    for _ in 0..80 {
+        fluid.step(0.01, Some((&w, QueryFilter::default())));
+    }
+    assert!(
+        fluid
+            .positions()
+            .iter()
+            .all(|p| p.is_finite() && p.y >= settings.collision_radius)
+    );
+}
+
+#[test]
+fn sph_rigid_boundary_exchanges_momentum_using_both_masses() {
+    let mut world = PhysicsWorld::new();
+    world.set_gravity(Vec3::ZERO).unwrap();
+    let id = world.add_body(RigidBodyBuilder::dynamic().mass(3.0).build());
+    let mut fluid = Fluid::new(FluidSettings {
+        gravity: Vec3::ZERO,
+        particle_mass: 1.0,
+        collision_radius: 0.1,
+        restitution: 1.0,
+        ..Default::default()
+    })
+    .unwrap();
+    fluid.push(Vec3::Y * 0.7, -Vec3::Y * 2.0);
+    assert!(fluid.step_coupled(0.1, &mut world, QueryFilter::default()));
+    let particle = fluid.velocities()[0];
+    let body = world.body(id).unwrap().velocity();
+    assert!(particle.distance(Vec3::Y) < 1e-12);
+    assert!(body.distance(-Vec3::Y) < 1e-12);
+    assert!((particle + body * 3.0).distance(-Vec3::Y * 2.0) < 1e-12);
+}
+
+#[test]
+fn equal_mass_particle_pair_exchanges_normal_velocities() {
+    let mut particles = Particles::default();
+    particles.push(Particle {
+        position: -Vec3::X * 0.1,
+        velocity: Vec3::X * 2.0,
+        remaining: 1.0,
+    });
+    particles.push(Particle {
+        position: Vec3::X * 0.1,
+        velocity: -Vec3::X,
+        remaining: 1.0,
+    });
+    assert!(particles.collide_pairs(0.15, 1.0));
+    let states: Vec<_> = particles.iter().collect();
+    assert_eq!(states[0].velocity, -Vec3::X);
+    assert_eq!(states[1].velocity, Vec3::X * 2.0);
+    assert!((states[0].position.distance(states[1].position) - 0.3).abs() < 1e-12);
+}

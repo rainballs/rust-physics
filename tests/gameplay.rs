@@ -77,3 +77,28 @@ fn vehicle_suspension_supports_expected_static_load() {
             .all(|c| (c.force.z - 1.1 * c.normal_load).abs() < 1e-9)
     );
 }
+
+#[test]
+fn sphere_buoyancy_matches_hemisphere_volume_and_centroid() {
+    use rust_physics::buoyancy::BuoyancyPlane;
+    let mut w = PhysicsWorld::new();
+    let mass = 500.0 * (4.0 / 3.0) * std::f64::consts::PI;
+    let body = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::sphere(1.0))
+            .mass(mass)
+            .build(),
+    );
+    let water = BuoyancyPlane {
+        point: Vec3::ZERO,
+        up: Vec3::Y,
+        density: 1_000.0,
+        drag: 20.0,
+        fluid_velocity: Vec3::ZERO,
+    };
+    let load = water.apply_sphere(&mut w, body).unwrap();
+    assert!((load.displaced_volume - 2.0 * std::f64::consts::PI / 3.0).abs() < 1e-12);
+    assert!(load.center.distance(Vec3::Y * -0.375) < 1e-12);
+    w.step_fixed().unwrap();
+    assert!(w.body(body).unwrap().position().length() < 1e-12);
+}

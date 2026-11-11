@@ -1,6 +1,8 @@
 //! Extended position-based cloth and tetrahedral volume constraints.
-use crate::spatial::project;
+use crate::grid::SpatialHash;
+use crate::particles::project_boundaries;
 use crate::{PhysicsWorld, QueryFilter, Vec3};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
@@ -32,6 +34,8 @@ pub struct SoftSettings {
     pub iterations: usize,
     pub damping: f64,
     pub radius: f64,
+    /// Optional minimum separation for non-adjacent node pairs.
+    pub self_collision_distance: Option<f64>,
 }
 
 impl Default for SoftSettings {
@@ -41,6 +45,7 @@ impl Default for SoftSettings {
             iterations: 8,
             damping: 0.15,
             radius: 0.02,
+            self_collision_distance: None,
         }
     }
 }
@@ -50,6 +55,38 @@ pub struct SoftBody {
     nodes: Vec<Node>,
     constraints: Vec<Constraint>,
     triangles: Vec<[usize; 3]>,
+    adjacent: BTreeSet<(usize, usize)>,
+    self_collision: Option<NodeBroadPhase>,
+}
+
+struct NodeBroadPhase {
+    spacing: f64,
+    grid: SpatialHash,
+    positions: Vec<Vec3>,
+}
+
+impl NodeBroadPhase {
+    fn solve(&mut self, nodes: &mut [Node], adjacent: &BTreeSet<(usize, usize)>) {
+        self.positions.clear();
+        self.positions.extend(nodes.iter().map(|n| n.position));
+        self.grid.rebuild(&self.positions);
+        let limit = self.spacing * self.spacing;
+        for i in 0..nodes.len() {
+            for j in self.grid.neighbors(self.positions[i]).filter(|&j| j > i) {
+                let [a, b] = nodes.get_disjoint_mut([i, j]).expect("distinct nodes");
+                let delta = b.position - a.position;
+                let distance_squared = delta.length_squared();
+                let total = a.inverse_mass + b.inverse_mass;
+                if distance_squared >= limit || total == 0.0 || adjacent.contains(&(i, j)) {
+                    continue;
+                }
+                let direction = delta.try_normalize().unwrap_or(Vec3::AXES[(i + j) % 3]);
+                let change = direction * ((self.spacing - distance_squared.sqrt()) / total);
+                a.position -= change * a.inverse_mass;
+                b.position += change * b.inverse_mass;
+            }
+        }
+    }
 }
 
 impl SoftBody {
@@ -105,6 +142,7 @@ impl SoftBody {
         if !rest.is_finite() || rest <= 0.0 {
             return false;
         }
+        self.adjacent.insert(ordered(indices[0], indices[1]));
         self.constraints.push(Constraint::Distance {
             indices,
             rest,
@@ -121,6 +159,11 @@ impl SoftBody {
         let rest = volume(indices.map(|i| self.nodes[i].position));
         if !rest.is_finite() || rest == 0.0 {
             return false;
+        }
+        for (i, &first) in indices.iter().enumerate() {
+            for &second in &indices[i + 1..] {
+                self.adjacent.insert(ordered(first, second));
+            }
         }
         self.constraints.push(Constraint::Volume {
             indices,
@@ -213,8 +256,23 @@ impl SoftBody {
             || settings.damping < 0.0
             || !settings.radius.is_finite()
             || settings.radius < 0.0
+            || settings
+                .self_collision_distance
+                .is_some_and(|d| !d.is_finite() || d <= 0.0)
         {
             return false;
+        }
+        if let Some(spacing) = settings.self_collision_distance
+            && self
+                .self_collision
+                .as_ref()
+                .is_none_or(|grid| grid.spacing != spacing)
+        {
+            self.self_collision = Some(NodeBroadPhase {
+                spacing,
+                grid: SpatialHash::new(spacing).expect("validated spacing"),
+                positions: Vec::new(),
+            });
         }
         let damping = (-settings.damping * dt).exp();
         for n in &mut self.nodes {
@@ -235,17 +293,20 @@ impl SoftBody {
             for constraint in &mut self.constraints {
                 constraint.solve(&mut self.nodes, dt_squared);
             }
+            if settings.self_collision_distance.is_some()
+                && let Some(grid) = &mut self.self_collision
+            {
+                grid.solve(&mut self.nodes, &self.adjacent);
+            }
             if let Some((world, filter)) = boundary {
                 for node in self.nodes.iter_mut().filter(|n| n.inverse_mass > 0.0) {
-                    for (id, b) in world.bodies() {
-                        if b.is_sensor() || !filter.accepts(id, b) {
-                            continue;
-                        }
-                        let (point, normal, distance) = project(b, node.position);
-                        if distance < settings.radius {
-                            node.position = point + settings.radius * normal;
-                        }
-                    }
+                    project_boundaries(
+                        &mut node.position,
+                        settings.radius,
+                        world,
+                        filter,
+                        |_, _, _| {},
+                    );
                 }
             }
         }
@@ -254,6 +315,10 @@ impl SoftBody {
         }
         true
     }
+}
+
+fn ordered(a: usize, b: usize) -> (usize, usize) {
+    (a.min(b), a.max(b))
 }
 
 fn volume([a, b, c, d]: [Vec3; 4]) -> f64 {

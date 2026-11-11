@@ -131,19 +131,8 @@ impl RaycastVehicle {
             if contact.force == Vec3::ZERO {
                 continue;
             }
-            world
-                .body_mut(self.chassis)
-                .expect("live chassis")
-                .add_force_at_point(contact.force, contact.hit.position);
-            if world
-                .body(contact.hit.body)
-                .is_some_and(|b| b.kind() == BodyKind::Dynamic)
-            {
-                world
-                    .body_mut(contact.hit.body)
-                    .expect("live raycast body")
-                    .add_force_at_point(-contact.force, contact.hit.position);
-            }
+            world.add_force_at_point(self.chassis, contact.force, contact.hit.position);
+            world.add_force_at_point(contact.hit.body, -contact.force, contact.hit.position);
         }
         Some(contacts)
     }

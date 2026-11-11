@@ -151,3 +151,43 @@ fn capsule_side_has_expected_mesh_contact() {
     assert!(contacts[0].normal.distance(Vec3::Y) < 1e-12);
     assert!((contacts[0].depth - 0.05).abs() < 1e-12);
 }
+
+#[test]
+fn flat_cylinder_manifold_against_terrain_has_expected_depth() {
+    let mesh = Arc::new(TriangleMesh::heightfield([3, 3], [2.0, 2.0], &[0.0; 9]).unwrap());
+    let terrain = RigidBodyBuilder::static_body()
+        .shape(Shape::Mesh(mesh))
+        .build();
+    let cylinder = RigidBodyBuilder::dynamic()
+        .shape(Shape::cylinder(0.35, 0.5))
+        .position(Vec3::new(1.0, 0.45, 1.0))
+        .build();
+    let mut contacts = Vec::new();
+    rust_physics::collision::contacts(&terrain, &cylinder, &mut contacts);
+    assert!(contacts.len() >= 3, "{contacts:?}");
+    for contact in contacts {
+        assert!(contact.normal.distance(Vec3::Y) < 1e-5);
+        assert!((contact.depth - 0.05).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn convex_capsule_cast_hits_static_heightfield() {
+    let mut world = PhysicsWorld::new();
+    let mesh = Arc::new(TriangleMesh::heightfield([2, 2], [5.0, 5.0], &[0.0; 4]).unwrap());
+    let id = world.add_body(
+        RigidBodyBuilder::static_body()
+            .shape(Shape::Mesh(mesh))
+            .build(),
+    );
+    let moving = RigidBodyBuilder::kinematic()
+        .shape(Shape::capsule(0.3, 0.45))
+        .position(Vec3::new(2.0, 3.0, 2.0))
+        .build();
+    let hit = world
+        .cast_shape(&moving, -Vec3::Y, 4.0, QueryFilter::default())
+        .unwrap();
+    assert_eq!(hit.body, id);
+    assert!((hit.distance - 2.25).abs() < 2e-6, "{hit:?}");
+    assert!(hit.normal.distance(Vec3::Y) < 1e-5);
+}

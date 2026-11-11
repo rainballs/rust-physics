@@ -2,17 +2,20 @@
 #![forbid(unsafe_code)]
 
 pub mod body;
+pub mod buoyancy;
 pub mod character;
 pub mod collision;
 pub mod compound;
 pub mod convex;
 pub mod debug;
+mod dynamic_tree;
 pub mod fluid;
 pub mod grid;
 pub mod hull;
 pub mod integrators;
 pub mod joints;
 pub mod particles;
+pub mod planar;
 pub mod softbody;
 pub mod spatial;
 pub mod terrain;

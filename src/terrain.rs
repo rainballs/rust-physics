@@ -1,6 +1,7 @@
 //! Static triangle-mesh and heightfield surfaces with local BVH acceleration.
-use crate::Vec3;
+use crate::convex::{self, PrimitiveSupport, TriangleSupport};
 use crate::spatial::{Aabb, Bvh, Proxy, ray_capsule};
+use crate::{RigidBody, Vec3};
 
 #[derive(Debug)]
 pub struct TriangleMesh {
@@ -164,6 +165,39 @@ impl TriangleMesh {
         );
     }
 
+    pub(crate) fn cast_convex(
+        &self,
+        moving: &RigidBody,
+        direction: Vec3,
+        max: f64,
+    ) -> Option<(f64, Vec3, Vec3)> {
+        let bounds = Aabb::of(moving)?;
+        let extent = (bounds.max - bounds.min) * 0.5;
+        let center = (bounds.max + bounds.min) * 0.5;
+        let tolerance = extent.max_element() * 1e-6;
+        let support = PrimitiveSupport::new(moving)?;
+        let mut best = None;
+        self.bvh.visit(
+            |node| {
+                Aabb {
+                    min: node.min - extent,
+                    max: node.max + extent,
+                }
+                .hit_ray(center, direction, max)
+            },
+            |index| {
+                let triangle = TriangleSupport(self.triangle(index));
+                if let Some((t, n, p)) =
+                    convex::cast_translation(&triangle, &support, direction, max, tolerance)
+                    && best.is_none_or(|(old, _, _, j)| t < old || (t == old && index < j))
+                {
+                    best = Some((t, n, p, index));
+                }
+            },
+        );
+        best.map(|(t, n, p, _)| (t, n, p))
+    }
+
     pub(crate) fn cast_sphere(
         &self,
         origin: Vec3,
@@ -192,7 +226,7 @@ pub(crate) fn triangle_normal([a, b, c]: [Vec3; 3]) -> Vec3 {
     (b - a).cross(c - a).normalize()
 }
 
-fn inside(p: Vec3, [a, b, c]: [Vec3; 3], n: Vec3) -> bool {
+pub(crate) fn inside_triangle(p: Vec3, [a, b, c]: [Vec3; 3], n: Vec3) -> bool {
     [(a, b), (b, c), (c, a)]
         .into_iter()
         .all(|(a, b)| (b - a).cross(p - a).dot(n) >= -1e-12 * (b - a).length_squared())
@@ -202,7 +236,7 @@ pub(crate) fn closest_triangle(point: Vec3, triangle: [Vec3; 3]) -> Vec3 {
     let [a, b, c] = triangle;
     let normal = triangle_normal(triangle);
     let projected = point - normal * (point - a).dot(normal);
-    if inside(projected, triangle, normal) {
+    if inside_triangle(projected, triangle, normal) {
         return projected;
     }
     [(a, b), (b, c), (c, a)]
@@ -225,7 +259,7 @@ fn ray_triangle(origin: Vec3, direction: Vec3, triangle: [Vec3; 3]) -> Option<(f
         return None;
     }
     let t = normal.dot(triangle[0] - origin) / denominator;
-    (t >= 0.0 && inside(origin + direction * t, triangle, normal))
+    (t >= 0.0 && inside_triangle(origin + direction * t, triangle, normal))
         .then_some((t, -normal * denominator.signum()))
 }
 
@@ -248,7 +282,7 @@ fn cast_triangle(
         let start_gap = n.dot(origin - triangle[0]) - radius;
         let t = start_gap / denominator.abs();
         let touch = origin + direction * t - n * radius;
-        if t >= 0.0 && inside(touch, triangle, normal) {
+        if t >= 0.0 && inside_triangle(touch, triangle, normal) {
             best = Some((t, n));
         }
     }

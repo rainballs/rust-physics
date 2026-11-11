@@ -284,3 +284,117 @@ fn synchronized_ccd_resolves_moving_spheres_at_relative_toi() {
         }
     }
 }
+
+#[test]
+fn planar_axis_locks_apply_to_forces_impulses_and_contact_correction() {
+    let mut w = PhysicsWorld::new();
+    floor(&mut w);
+    let id = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .planar_xy()
+            .position(Vec3::Y * 2.0)
+            .velocity(Vec3::Z * 3.0)
+            .angular_velocity(Vec3::new(2.0, 1.0, 3.0))
+            .build(),
+    );
+    assert!(w.apply_impulse(id, Vec3::Z, Vec3::Y * 2.0 + Vec3::X));
+    for _ in 0..90 {
+        w.add_force_at_point(id, Vec3::Z * 10.0, Vec3::ZERO);
+        w.step_fixed().unwrap();
+    }
+    let body = w.body(id).unwrap();
+    assert_eq!(body.position().z, 0.0);
+    assert_eq!(body.velocity().z, 0.0);
+    assert_eq!(body.angular_velocity().x, 0.0);
+    assert_eq!(body.angular_velocity().y, 0.0);
+    assert!((body.position().y - 0.5).abs() < 0.003);
+}
+
+#[test]
+fn angular_lock_uses_restricted_inertia_for_a_rotated_cuboid() {
+    let q = Quat::from_rotation_y(0.6);
+    let builder = RigidBodyBuilder::dynamic()
+        .shape(Shape::cuboid(Vec3::new(0.5, 0.7, 1.1)))
+        .rotation(q);
+    let free = builder.clone().build();
+    let restricted = builder
+        .rotation_axes([false, false, true])
+        .angular_velocity(Vec3::Z)
+        .build();
+    let expected = free.world_inverse_inertia().inverse().z_axis.z;
+    assert!((restricted.angular_momentum().z - expected).abs() < 1e-12);
+    assert!(restricted.angular_velocity().distance(Vec3::Z) < 1e-12);
+    assert_eq!(restricted.world_inverse_inertia().x_axis, Vec3::ZERO);
+}
+
+#[test]
+fn synchronized_ccd_budget_cannot_pause_unrelated_falling_bodies() {
+    let mut w = PhysicsWorld::new();
+    w.set_settings(rust_physics::Settings {
+        ccd_moving_spheres: true,
+        ..Default::default()
+    })
+    .unwrap();
+    // Two closely spaced finite walls create more than 32 impacts in one substep.
+    for x in [-0.12, 0.12] {
+        w.add_body(
+            RigidBodyBuilder::static_body()
+                .shape(Shape::cuboid(Vec3::new(0.01, 1.0, 1.0)))
+                .position(Vec3::X * x)
+                .material(Material {
+                    restitution: 1.0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+    }
+    w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::sphere(0.1))
+            .gravity_scale(0.0)
+            .velocity(Vec3::X * 1_000.0)
+            .ccd(true)
+            .build(),
+    );
+    let falling = w.add_body(RigidBodyBuilder::dynamic().position(Vec3::Y * 5.0).build());
+    let stats = w.step_fixed().unwrap();
+    assert!(stats.ccd_budget_fallbacks > 0);
+    let y = w.body(falling).unwrap().position().y;
+    let expected = 5.0 - 9.81 * 3.0 / 120.0_f64.powi(2);
+    assert!((y - expected).abs() < 1e-11);
+}
+
+#[test]
+fn non_finite_external_impulse_is_rejected_without_changing_state() {
+    let mut w = PhysicsWorld::new();
+    let id = w.add_body(RigidBodyBuilder::dynamic().mass(0.01).build());
+    assert!(!w.apply_impulse(id, Vec3::X * f64::MAX, Vec3::ZERO));
+    assert_eq!(w.body(id).unwrap().velocity(), Vec3::ZERO);
+    assert_eq!(w.body(id).unwrap().angular_momentum(), Vec3::ZERO);
+}
+
+#[test]
+fn origin_rebase_keeps_relative_geometry_velocities_and_handles() {
+    let mut world = PhysicsWorld::new();
+    let offset = Vec3::new(1e9, -1e9, 1e9);
+    world.add_body(
+        RigidBodyBuilder::static_body()
+            .shape(Shape::Plane)
+            .position(offset)
+            .build(),
+    );
+    let id = world.add_body(
+        RigidBodyBuilder::dynamic()
+            .position(offset + Vec3::Y * 2.0)
+            .velocity(Vec3::X)
+            .build(),
+    );
+    assert!(world.rebase_origin(offset));
+    assert_eq!(world.body(id).unwrap().position(), Vec3::Y * 2.0);
+    assert_eq!(world.body(id).unwrap().velocity(), Vec3::X);
+    assert!(!world.rebase_origin(Vec3::splat(f64::NAN)));
+    for _ in 0..120 {
+        world.step_fixed().unwrap();
+    }
+    assert!((world.body(id).unwrap().position().y - 0.5).abs() < 0.003);
+}

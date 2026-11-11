@@ -142,7 +142,11 @@ pub struct RigidBody {
     pub(crate) torque: Vec3,
     pub(crate) inverse_mass: f64,
     inertia: Mat3,
-    pub(crate) inverse_inertia: Mat3,
+    pub(crate) custom_inertia: bool,
+    inverse_inertia: Mat3,
+    constrained_inverse_inertia: Mat3,
+    pub(crate) linear_axes: Vec3,
+    pub(crate) angular_axes: Vec3,
     pub(crate) material: Material,
     pub(crate) damping: [f64; 2],
     pub(crate) gravity_scale: f64,
@@ -196,12 +200,37 @@ impl RigidBody {
     }
 
     pub fn world_inverse_inertia(&self) -> Mat3 {
+        if self.angular_axes != Vec3::ONE {
+            return self.constrained_inverse_inertia;
+        }
         let r = Mat3::from_quat(self.rotation);
         r * self.inverse_inertia * r.transpose()
     }
 
     pub(crate) fn apply_inverse_inertia(&self, v: Vec3) -> Vec3 {
+        if self.angular_axes != Vec3::ONE {
+            return self.constrained_inverse_inertia * v;
+        }
         self.rotation * (self.inverse_inertia * (self.rotation.conjugate() * v))
+    }
+
+    pub(crate) fn apply_inverse_mass(&self, impulse: Vec3) -> Vec3 {
+        (impulse * self.linear_axes) * self.inverse_mass
+    }
+
+    fn refresh_constrained_inertia(&mut self) {
+        if self.kind != BodyKind::Dynamic || self.angular_axes == Vec3::ONE {
+            return;
+        }
+        let r = Mat3::from_quat(self.rotation);
+        let inertia = r * self.inertia * r.transpose();
+        let scale = inertia.x_axis.x.max(inertia.y_axis.y).max(inertia.z_axis.z);
+        let p = Mat3::from_diagonal(self.angular_axes);
+        let inactive = Mat3::IDENTITY - p;
+        // Invert the inertia restricted to the active subspace. The identity
+        // on the complement makes the matrix invertible without coupling it.
+        self.constrained_inverse_inertia =
+            p * (p * (inertia * scale.recip()) * p + inactive).inverse() * p * scale.recip();
     }
 
     pub fn wake(&mut self) {
@@ -209,9 +238,23 @@ impl RigidBody {
         self.sleep_time = 0.0;
     }
 
+    /// Teleports the body to a finite pose and preserves world-space momenta.
+    /// Velocity limits still apply to subsequent integration.
+    pub fn set_pose(&mut self, position: Vec3, rotation: Quat) -> bool {
+        let length = rotation.length();
+        if !position.is_finite() || !length.is_finite() || length <= f64::MIN_POSITIVE {
+            return false;
+        }
+        self.position = position;
+        self.rotation = rotation / length;
+        self.refresh_constrained_inertia();
+        self.wake();
+        true
+    }
+
     pub fn set_velocity(&mut self, velocity: Vec3) {
         if self.kind != BodyKind::Static && velocity.is_finite() {
-            self.velocity = velocity;
+            self.velocity = velocity * self.linear_axes;
             self.wake();
         }
     }
@@ -220,48 +263,69 @@ impl RigidBody {
         if !velocity.is_finite() {
             return;
         }
+        let velocity = velocity * self.angular_axes;
         match self.kind {
             BodyKind::Static => return,
             BodyKind::Kinematic => self.kinematic_spin = velocity,
             BodyKind::Dynamic => {
                 let local = self.rotation.conjugate() * velocity;
-                self.angular_momentum = self.rotation * (self.inertia * local);
+                self.angular_momentum =
+                    (self.rotation * (self.inertia * local)) * self.angular_axes;
             }
         }
         self.wake();
     }
 
     /// Accumulates force through all substeps of the next public step.
-    pub fn add_force(&mut self, force: Vec3) {
-        self.add_force_at_point(force, self.position);
+    pub fn add_force(&mut self, force: Vec3) -> bool {
+        self.add_force_at_point(force, self.position)
     }
 
-    pub fn add_force_at_point(&mut self, force: Vec3, point: Vec3) {
-        if self.kind == BodyKind::Dynamic && force.is_finite() && point.is_finite() {
-            self.force += force;
-            self.torque += (point - self.position).cross(force);
-            self.wake();
+    pub fn add_force_at_point(&mut self, force: Vec3, point: Vec3) -> bool {
+        if self.kind != BodyKind::Dynamic || !force.is_finite() || !point.is_finite() {
+            return false;
         }
+        let accumulated_force = self.force + force;
+        let accumulated_torque = self.torque + (point - self.position).cross(force);
+        if !accumulated_force.is_finite() || !accumulated_torque.is_finite() {
+            return false;
+        }
+        self.force = accumulated_force;
+        self.torque = accumulated_torque;
+        self.wake();
+        true
     }
 
-    pub fn add_torque(&mut self, torque: Vec3) {
-        if self.kind == BodyKind::Dynamic && torque.is_finite() {
-            self.torque += torque;
-            self.wake();
+    pub fn add_torque(&mut self, torque: Vec3) -> bool {
+        let accumulated = self.torque + torque;
+        if self.kind != BodyKind::Dynamic || !accumulated.is_finite() {
+            return false;
         }
+        self.torque = accumulated;
+        self.wake();
+        true
     }
 
-    pub fn apply_impulse(&mut self, impulse: Vec3, point: Vec3) {
-        if self.kind == BodyKind::Dynamic && impulse.is_finite() && point.is_finite() {
-            self.wake();
-            self.solver_impulse(impulse, point - self.position);
+    pub fn apply_impulse(&mut self, impulse: Vec3, point: Vec3) -> bool {
+        if self.kind != BodyKind::Dynamic || !impulse.is_finite() || !point.is_finite() {
+            return false;
         }
+        let velocity = self.velocity + self.apply_inverse_mass(impulse);
+        let momentum =
+            self.angular_momentum + (point - self.position).cross(impulse) * self.angular_axes;
+        if !velocity.is_finite() || !momentum.is_finite() {
+            return false;
+        }
+        self.wake();
+        self.velocity = velocity;
+        self.angular_momentum = momentum;
+        true
     }
 
     pub(crate) fn solver_impulse(&mut self, impulse: Vec3, offset: Vec3) {
         if self.inverse_mass > 0.0 && !self.asleep {
-            self.velocity += impulse * self.inverse_mass;
-            self.angular_momentum += offset.cross(impulse);
+            self.velocity += self.apply_inverse_mass(impulse);
+            self.angular_momentum += offset.cross(impulse) * self.angular_axes;
         }
     }
 
@@ -291,8 +355,10 @@ impl RigidBody {
         let original = self.rotation;
         // Midpoint angular velocity for anisotropic inertia and fixed world momentum.
         self.rotation = (Quat::from_scaled_axis(spin * (0.5 * dt)) * original).normalize();
+        self.refresh_constrained_inertia();
         self.rotation =
             (Quat::from_scaled_axis(self.angular_velocity() * dt) * original).normalize();
+        self.refresh_constrained_inertia();
     }
 }
 
@@ -301,6 +367,7 @@ pub struct RigidBodyBuilder {
     body: RigidBody,
     mass: f64,
     spin: Vec3,
+    inertia: Option<Mat3>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +395,11 @@ impl RigidBodyBuilder {
                 torque: Vec3::ZERO,
                 inverse_mass: 0.0,
                 inertia: Mat3::ZERO,
+                custom_inertia: false,
                 inverse_inertia: Mat3::ZERO,
+                constrained_inverse_inertia: Mat3::ZERO,
+                linear_axes: Vec3::ONE,
+                angular_axes: Vec3::ONE,
                 material: Material::default(),
                 damping: [0.0, 0.0],
                 gravity_scale: 1.0,
@@ -341,6 +412,7 @@ impl RigidBodyBuilder {
             },
             mass: 1.0,
             spin: Vec3::ZERO,
+            inertia: None,
         }
     }
 
@@ -378,6 +450,13 @@ impl RigidBodyBuilder {
         self.mass = value;
         self
     }
+    /// Overrides the local center-of-mass tensor of a dynamic body.
+    /// The tensor must be symmetric positive definite and include the mass.
+    pub fn local_inertia(mut self, value: Mat3) -> Self {
+        self.inertia = Some(value);
+        self
+    }
+
     pub fn material(mut self, value: Material) -> Self {
         self.body.material = value;
         self
@@ -404,6 +483,24 @@ impl RigidBodyBuilder {
         self
     }
 
+    /// Selects world-space axes for linear motion. False locks the axis.
+    pub fn translation_axes(mut self, enabled: [bool; 3]) -> Self {
+        self.body.linear_axes = Vec3::from_array(enabled.map(|v| f64::from(u8::from(v))));
+        self
+    }
+
+    /// Selects world-space axes for angular motion. False locks the axis.
+    pub fn rotation_axes(mut self, enabled: [bool; 3]) -> Self {
+        self.body.angular_axes = Vec3::from_array(enabled.map(|v| f64::from(u8::from(v))));
+        self
+    }
+
+    /// Restricts motion to XY translation and rotation about world Z.
+    pub fn planar_xy(self) -> Self {
+        self.translation_axes([true, true, false])
+            .rotation_axes([false, false, true])
+    }
+
     /// Validates and normalizes the initial state.
     pub fn try_build(self) -> Result<RigidBody, InvalidBody> {
         let mut b = self.body;
@@ -427,7 +524,10 @@ impl RigidBodyBuilder {
         }
         b.rotation /= rotation_length;
         if b.kind == BodyKind::Dynamic {
-            let inertia = b.shape.inertia(self.mass);
+            if matches!(b.shape, Shape::Plane) {
+                return Err(InvalidBody);
+            }
+            let inertia = self.inertia.unwrap_or_else(|| b.shape.inertia(self.mass));
             let scale = inertia.x_axis.x.max(inertia.y_axis.y).max(inertia.z_axis.z);
             if !self.mass.is_finite()
                 || self.mass <= 0.0
@@ -438,7 +538,18 @@ impl RigidBodyBuilder {
                 return Err(InvalidBody);
             }
             let normalized = inertia * scale.recip();
-            if normalized.determinant() <= 0.0 {
+            let asymmetry = normalized - normalized.transpose();
+            if asymmetry
+                .x_axis
+                .abs()
+                .max(asymmetry.y_axis.abs())
+                .max(asymmetry.z_axis.abs())
+                .max_element()
+                > 1e-12
+                || normalized.x_axis.x <= 0.0
+                || normalized.x_axis.x * normalized.y_axis.y - normalized.x_axis.y.powi(2) <= 0.0
+                || normalized.determinant() <= 0.0
+            {
                 return Err(InvalidBody);
             }
             let inverse = normalized.inverse() * scale.recip();
@@ -447,12 +558,15 @@ impl RigidBodyBuilder {
             }
             b.inverse_mass = self.mass.recip();
             b.inertia = inertia;
+            b.custom_inertia = self.inertia.is_some();
             b.inverse_inertia = inverse;
         } else if b.kind == BodyKind::Static {
             b.velocity = Vec3::ZERO;
         }
+        b.velocity *= b.linear_axes;
+        b.refresh_constrained_inertia();
         b.set_angular_velocity(self.spin);
-        if !b.angular_momentum.is_finite() {
+        if !b.angular_momentum.is_finite() || !b.constrained_inverse_inertia.is_finite() {
             return Err(InvalidBody);
         }
         Ok(b)

@@ -160,3 +160,26 @@ fn rigid_tetrahedron_centroid_inertia_and_surface_queries() {
         [id]
     );
 }
+
+#[test]
+fn gjk_distance_returns_closest_witnesses() {
+    use rust_physics::convex::{ConvexDistance, distance};
+    let cube = cube();
+    let moved = Transformed {
+        shape: &cube,
+        position: Vec3::new(3.0, 3.0, 0.0),
+        rotation: Quat::IDENTITY,
+    };
+    let ConvexDistance::Separated {
+        distance,
+        normal,
+        point_a,
+        point_b,
+    } = distance(&cube, &moved, 1e-9)
+    else {
+        panic!("expected distance");
+    };
+    assert!((distance - 2.0_f64.sqrt()).abs() < 1e-12);
+    assert!(normal.distance((Vec3::X + Vec3::Y).normalize()) < 1e-12);
+    assert!((point_b - point_a).distance(Vec3::X + Vec3::Y) < 1e-12);
+}

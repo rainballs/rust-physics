@@ -1,6 +1,7 @@
 //! Structure-of-arrays particles with emitters and independent motion updates.
+use crate::grid::SpatialHash;
 use crate::spatial::project;
-use crate::{PhysicsWorld, QueryFilter, Vec3};
+use crate::{BodyHandle, PhysicsWorld, QueryFilter, RigidBody, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Particle {
@@ -116,6 +117,8 @@ pub struct Particles {
     positions: Vec<Vec3>,
     velocities: Vec<Vec3>,
     lifetimes: Vec<f64>,
+    pair_grid: Option<(f64, SpatialHash)>,
+    pair_positions: Vec<Vec3>,
 }
 
 impl Particles {
@@ -210,6 +213,58 @@ impl Particles {
         self.lifetimes.truncate(target);
     }
 
+    /// Resolves one pass of equal-mass sphere pairs using a spatial hash.
+    /// Runs after motion and expiration. Additional passes can resolve dense
+    /// overlaps introduced by the first pass.
+    pub fn collide_pairs(&mut self, radius: f64, restitution: f64) -> bool {
+        let diameter = 2.0 * radius;
+        if !diameter.is_finite() || diameter <= 0.0 || !(0.0..=1.0).contains(&restitution) {
+            return false;
+        }
+        if self
+            .pair_grid
+            .as_ref()
+            .is_none_or(|(width, _)| *width != diameter)
+        {
+            self.pair_grid = Some((
+                diameter,
+                SpatialHash::new(diameter).expect("validated diameter"),
+            ));
+        }
+        let (_, grid) = self.pair_grid.as_mut().expect("initialized pair grid");
+        self.pair_positions.clear();
+        self.pair_positions.extend_from_slice(&self.positions);
+        grid.rebuild(&self.pair_positions);
+        for (i, &position) in self.pair_positions.iter().enumerate() {
+            for j in grid.neighbors(position).filter(|&j| j > i) {
+                let [a, b] = self
+                    .positions
+                    .get_disjoint_mut([i, j])
+                    .expect("distinct particles");
+                let delta = *b - *a;
+                let distance = delta.length();
+                if distance >= diameter {
+                    continue;
+                }
+                let normal = delta.try_normalize().unwrap_or(Vec3::AXES[(i + j) % 3]);
+                let correction = normal * ((diameter - distance) * 0.5);
+                *a -= correction;
+                *b += correction;
+                let [va, vb] = self
+                    .velocities
+                    .get_disjoint_mut([i, j])
+                    .expect("distinct particles");
+                let speed = (*vb - *va).dot(normal);
+                if speed < 0.0 {
+                    let impulse = normal * (-(1.0 + restitution) * speed * 0.5);
+                    *va -= impulse;
+                    *vb += impulse;
+                }
+            }
+        }
+        true
+    }
+
     /// Resolves discrete particle contacts against the rigid world. Collider
     /// surface velocity contributes to bounce. Coupling is one-way.
     pub fn collide(
@@ -266,6 +321,22 @@ pub(crate) fn collide_point(
     world: &PhysicsWorld,
     filter: QueryFilter,
 ) {
+    project_boundaries(position, radius, world, filter, |body, surface, normal| {
+        let surface_speed = body.point_velocity(surface - body.position());
+        let speed = (*velocity - surface_speed).dot(normal);
+        if speed < 0.0 {
+            *velocity -= (1.0 + restitution) * speed * normal;
+        }
+    });
+}
+
+pub(crate) fn project_boundaries(
+    position: &mut Vec3,
+    radius: f64,
+    world: &PhysicsWorld,
+    filter: QueryFilter,
+    mut on_contact: impl FnMut(&RigidBody, Vec3, Vec3),
+) {
     for (id, body) in world.bodies() {
         if body.is_sensor() || !filter.accepts(id, body) {
             continue;
@@ -273,12 +344,38 @@ pub(crate) fn collide_point(
         let (surface, normal, distance) = project(body, *position);
         if distance < radius {
             *position = surface + radius * normal;
-            let surface_speed = body.point_velocity(surface - body.position());
-            let speed = (*velocity - surface_speed).dot(normal);
-            if speed < 0.0 {
-                *velocity -= (1.0 + restitution) * speed * normal;
-            }
+            on_contact(body, surface, normal);
         }
+    }
+}
+
+pub(crate) fn coupled_boundary(
+    position: &mut Vec3,
+    velocity: &mut Vec3,
+    radius: f64,
+    restitution: f64,
+    inverse_mass: f64,
+    world: &mut PhysicsWorld,
+    targets: &[BodyHandle],
+) {
+    for &handle in targets {
+        let body = world.body(handle).expect("collected boundary");
+        let (surface, normal, distance) = project(body, *position);
+        if distance >= radius {
+            continue;
+        }
+        *position = surface + radius * normal;
+        let offset = surface - body.position();
+        let speed = (*velocity - body.point_velocity(offset)).dot(normal);
+        if speed >= 0.0 {
+            continue;
+        }
+        let cross = offset.cross(normal);
+        let response = normal.dot(body.apply_inverse_mass(normal))
+            + cross.dot(body.apply_inverse_inertia(cross));
+        let impulse = normal * (-(1.0 + restitution) * speed / (inverse_mass + response));
+        *velocity += impulse * inverse_mass;
+        world.apply_impulse(handle, -impulse, surface);
     }
 }
 

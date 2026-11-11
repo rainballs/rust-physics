@@ -76,8 +76,12 @@ pub fn lines(world: &PhysicsWorld, options: DebugOptions, mut emit: impl FnMut(L
         if options.velocities && b.velocity() != Vec3::ZERO {
             line(center, center + b.velocity() * 0.2, LineKind::Velocity);
         }
-        if options.forces && b.force != Vec3::ZERO {
-            line(center, center + b.force * 0.1, LineKind::Force);
+        if options.forces && b.inverse_mass() > 0.0 {
+            let gravity = world.settings().gravity * (b.gravity_scale / b.inverse_mass());
+            let force = (b.force + gravity) * b.linear_axes;
+            if force != Vec3::ZERO {
+                line(center, center + force * 0.1, LineKind::Force);
+            }
         }
         if options.centers {
             for axis in Vec3::AXES {

@@ -53,4 +53,84 @@ impl SpatialHash {
             .flatten()
             .copied()
     }
+    /// Unique neighbor pairs at distances strictly below one cell width.
+    pub(crate) fn pairs<'a>(
+        &'a self,
+        positions: &'a [Vec3],
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
+        let limit = self.width * self.width;
+        positions.iter().enumerate().flat_map(move |(i, &p)| {
+            self.neighbors(p)
+                .filter(move |&j| j > i && p.distance_squared(positions[j]) < limit)
+                .map(move |j| (i, j))
+        })
+    }
+}
+
+use crate::spatial::Proxy;
+
+/// Uniform grid over full AABB extents. Very large proxies use a direct
+/// fallback to bound cell replication.
+#[derive(Default)]
+pub(crate) struct ProxyGrid {
+    cells: HashMap<[i64; 3], Vec<usize>>,
+    recycled: Vec<Vec<usize>>,
+    low: Vec<[i64; 3]>,
+    large: Vec<usize>,
+    large_flags: Vec<bool>,
+}
+
+impl ProxyGrid {
+    pub fn pairs(&mut self, width: f64, proxies: &[Proxy], mut emit: impl FnMut(usize, usize)) {
+        for (_, mut bucket) in self.cells.drain() {
+            bucket.clear();
+            self.recycled.push(bucket);
+        }
+        self.low.clear();
+        self.large.clear();
+        self.large_flags.clear();
+        let coord = |p: Vec3| (p / width).to_array().map(|v| v.floor() as i64);
+        for (i, proxy) in proxies.iter().enumerate() {
+            let low = coord(proxy.bounds.min);
+            let high = coord(proxy.bounds.max);
+            self.low.push(low);
+            let span = std::array::from_fn::<_, 3, _>(|j| {
+                high[j].saturating_sub(low[j]).saturating_add(1)
+            });
+            let large = span.into_iter().fold(1_i64, i64::saturating_mul) > 512;
+            self.large_flags.push(large);
+            if large {
+                self.large.push(i);
+                continue;
+            }
+            for x in low[0]..=high[0] {
+                for y in low[1]..=high[1] {
+                    for z in low[2]..=high[2] {
+                        self.cells
+                            .entry([x, y, z])
+                            .or_insert_with(|| self.recycled.pop().unwrap_or_default())
+                            .push(i);
+                    }
+                }
+            }
+        }
+        for (&cell, bucket) in &self.cells {
+            for (i, &a) in bucket.iter().enumerate() {
+                for &b in &bucket[i + 1..] {
+                    let first_common =
+                        std::array::from_fn(|axis| self.low[a][axis].max(self.low[b][axis]));
+                    if cell == first_common && proxies[a].bounds.intersects(proxies[b].bounds) {
+                        emit(proxies[a].index, proxies[b].index);
+                    }
+                }
+            }
+        }
+        for &a in &self.large {
+            for (b, proxy) in proxies.iter().enumerate() {
+                if (!self.large_flags[b] || a < b) && proxies[a].bounds.intersects(proxy.bounds) {
+                    emit(proxies[a].index, proxy.index);
+                }
+            }
+        }
+    }
 }

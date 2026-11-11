@@ -1,8 +1,10 @@
 //! Experimental weakly compressible smoothed particle hydrodynamics (SPH).
 use crate::grid::SpatialHash;
-use crate::particles::collide_point;
+use crate::particles::{collide_point, coupled_boundary};
 use crate::{PhysicsWorld, QueryFilter, Vec3};
 use std::f64::consts::PI;
+mod pbf;
+pub use pbf::{PbfFluid, PbfSettings};
 
 #[derive(Clone, Copy, Debug)]
 pub struct FluidSettings {
@@ -39,6 +41,8 @@ pub struct Fluid {
     densities: Vec<f64>,
     accelerations: Vec<Vec3>,
     neighbors: SpatialHash,
+    pairs: Vec<(usize, usize)>,
+    pressure_terms: Vec<f64>,
     kernels: Kernels,
 }
 
@@ -86,6 +90,8 @@ impl Fluid {
             densities: Vec::new(),
             accelerations: Vec::new(),
             neighbors: SpatialHash::new(h)?,
+            pairs: Vec::new(),
+            pressure_terms: Vec::new(),
             kernels,
         })
     }
@@ -125,6 +131,32 @@ impl Fluid {
             / (max_speed + self.settings.pressure_stiffness.sqrt()).max(1e-8)
     }
 
+    /// Advances SPH and exchanges normal impulses with dynamic boundaries.
+    /// The caller advances the rigid world separately. Static and kinematic
+    /// boundaries retain their prescribed motion.
+    pub fn step_coupled(&mut self, dt: f64, world: &mut PhysicsWorld, filter: QueryFilter) -> bool {
+        if !self.step(dt, None) {
+            return false;
+        }
+        let targets: Vec<_> = world
+            .bodies()
+            .filter_map(|(id, body)| (!body.is_sensor() && filter.accepts(id, body)).then_some(id))
+            .collect();
+        let s = self.settings;
+        for (position, velocity) in self.positions.iter_mut().zip(&mut self.velocities) {
+            coupled_boundary(
+                position,
+                velocity,
+                s.collision_radius,
+                s.restitution,
+                s.particle_mass.recip(),
+                world,
+                &targets,
+            );
+        }
+        true
+    }
+
     pub fn step(&mut self, dt: f64, boundary: Option<(&PhysicsWorld, QueryFilter)>) -> bool {
         if !dt.is_finite() || dt <= 0.0 {
             return false;
@@ -132,50 +164,44 @@ impl Fluid {
         let s = self.settings;
         let k = &self.kernels;
         self.neighbors.rebuild(&self.positions);
-        for (i, &position) in self.positions.iter().enumerate() {
-            self.densities[i] = self
-                .neighbors
-                .neighbors(position)
-                .map(|j| {
-                    let distance_squared = position.distance_squared(self.positions[j]);
-                    (k.h2 - distance_squared).max(0.0).powi(3)
-                })
-                .sum::<f64>()
-                * k.poly6
-                * s.particle_mass;
+        self.pairs.clear();
+        self.pairs.extend(self.neighbors.pairs(&self.positions));
+        let density_scale = k.poly6 * s.particle_mass;
+        self.densities.fill(density_scale * k.h2.powi(3));
+        for &(i, j) in &self.pairs {
+            let gap = k.h2 - self.positions[i].distance_squared(self.positions[j]);
+            let density = density_scale * gap.powi(3);
+            self.densities[i] += density;
+            self.densities[j] += density;
         }
+        self.pressure_terms.clear();
+        self.pressure_terms.extend(
+            self.densities
+                .iter()
+                .map(|&rho| s.pressure_stiffness * (rho - s.rest_density).max(0.0) / rho.powi(2)),
+        );
         self.accelerations.clear();
         self.accelerations.resize(self.positions.len(), s.gravity);
-        let pressure =
-            |rho: f64| s.pressure_stiffness * (rho - s.rest_density).max(0.0) / rho.powi(2);
-        for (i, &position) in self.positions.iter().enumerate() {
-            let density_i = self.densities[i];
-            let pressure_i = pressure(density_i);
-            for j in self.neighbors.neighbors(position).filter(|&j| j > i) {
-                let delta = position - self.positions[j];
-                let r2 = delta.length_squared();
-                if r2 >= k.h2 {
-                    continue;
-                }
-                let r = r2.sqrt();
-                let gap = s.smoothing_radius - r;
-                let density_j = self.densities[j];
-                let repulsion = if r > 0.0 {
-                    (delta / r)
-                        * (s.particle_mass
-                            * (pressure_i + pressure(density_j))
-                            * k.spiky
-                            * gap
-                            * gap)
-                } else {
-                    Vec3::ZERO
-                };
-                let viscosity = (self.velocities[j] - self.velocities[i])
-                    * (s.viscosity * s.particle_mass * k.viscosity * gap / (density_i * density_j));
-                let pair = repulsion + viscosity;
-                self.accelerations[i] += pair;
-                self.accelerations[j] -= pair;
-            }
+        let visc_scale = s.viscosity * s.particle_mass * k.viscosity;
+        for &(i, j) in &self.pairs {
+            let delta = self.positions[i] - self.positions[j];
+            let distance = delta.length();
+            let gap = s.smoothing_radius - distance;
+            let repulsion = if distance > 0.0 {
+                (delta / distance)
+                    * (s.particle_mass
+                        * (self.pressure_terms[i] + self.pressure_terms[j])
+                        * k.spiky
+                        * gap
+                        * gap)
+            } else {
+                Vec3::ZERO
+            };
+            let viscosity = (self.velocities[j] - self.velocities[i])
+                * (visc_scale * gap / (self.densities[i] * self.densities[j]));
+            let pair = repulsion + viscosity;
+            self.accelerations[i] += pair;
+            self.accelerations[j] -= pair;
         }
         for ((p, v), a) in self
             .positions
