@@ -37,6 +37,8 @@ pub struct Settings {
     pub sleep_speed: f64,
     pub sleep_time: f64,
     pub ccd: bool,
+    /// Enables synchronized swept collisions involving translating spheres.
+    pub ccd_moving_spheres: bool,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             sleep_speed: 0.035,
             sleep_time: 0.6,
             ccd: true,
+            ccd_moving_spheres: false,
         }
     }
 }
@@ -107,6 +110,26 @@ pub struct CollisionEvent {
     pub b: BodyHandle,
     pub sensor: bool,
     pub started: bool,
+}
+
+/// A swept impact observed during the last public step.
+#[derive(Clone, Copy, Debug)]
+pub struct CcdImpact {
+    pub moving: BodyHandle,
+    pub target: BodyHandle,
+    pub point: Vec3,
+    /// World normal from the target toward the moving sphere.
+    pub normal: Vec3,
+    /// Seconds since the start of the public step.
+    pub time: f64,
+}
+
+struct ImpactCandidate {
+    time: f64,
+    moving: usize,
+    target: usize,
+    radius: f64,
+    normal: Vec3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -274,6 +297,7 @@ pub struct PhysicsWorld {
     planes: Vec<usize>,
     candidates: Vec<[usize; 2]>,
     ccd_targets: Vec<usize>,
+    impacts: Vec<CcdImpact>,
     joints: BTreeMap<JointHandle, Joint>,
 }
 
@@ -305,6 +329,7 @@ impl PhysicsWorld {
             planes: Vec::new(),
             candidates: Vec::new(),
             ccd_targets: Vec::new(),
+            impacts: Vec::new(),
             joints: BTreeMap::new(),
         }
     }
@@ -421,6 +446,11 @@ impl PhysicsWorld {
     /// Transitions observed during the last successful step, in substep order.
     pub fn events(&self) -> &[CollisionEvent] {
         &self.events
+    }
+
+    /// Swept impacts sorted by time within the last successful step.
+    pub fn ccd_impacts(&self) -> &[CcdImpact] {
+        &self.impacts
     }
 
     /// World-space contacts sampled before the final substep's penetration correction.
@@ -576,9 +606,17 @@ impl PhysicsWorld {
         }
         let mut stats = StepStats::default();
         self.events.clear();
-        for _ in 0..self.settings.substeps {
-            self.substep(h, &mut stats);
+        self.impacts.clear();
+        for substep in 0..self.settings.substeps {
+            self.substep(h, h * substep as f64, &mut stats);
         }
+        self.impacts.sort_unstable_by(|a, b| {
+            a.time
+                .total_cmp(&b.time)
+                .then(a.moving.cmp(&b.moving))
+                .then(a.target.cmp(&b.target))
+        });
+        stats.ccd_impacts = self.impacts.len();
         for (_, body) in &mut self.bodies {
             body.force = Vec3::ZERO;
             body.torque = Vec3::ZERO;
@@ -587,7 +625,7 @@ impl PhysicsWorld {
         Ok(stats)
     }
 
-    fn substep(&mut self, h: f64, stats: &mut StepStats) {
+    fn substep(&mut self, h: f64, start: f64, stats: &mut StepStats) {
         for (_, body) in &mut self.bodies {
             if body.kind == BodyKind::Dynamic && !body.asleep {
                 body.velocity += (self.settings.gravity * body.gravity_scale
@@ -602,7 +640,7 @@ impl PhysicsWorld {
         for _ in 0..self.settings.iterations {
             self.solve_joints();
         }
-        self.advance_poses(h, stats);
+        self.advance_poses(h, start);
         self.collect_candidates();
         stats.candidate_pairs += self.candidates.len();
 
@@ -1031,90 +1069,160 @@ impl PhysicsWorld {
             .sort_unstable_by_key(|&[a, b]| (self.bodies[a].0, self.bodies[b].0));
     }
 
-    fn advance_poses(&mut self, h: f64, stats: &mut StepStats) {
-        // Targets are static, so advancing the moving bodies in dense storage
-        // order cannot change any cast.
+    fn advance_poses(&mut self, h: f64, start: f64) {
         self.ccd_targets.clear();
-        if self.settings.ccd {
-            self.ccd_targets.extend(
-                self.bodies.iter().enumerate().filter_map(|(i, (_, b))| {
-                    (b.kind == BodyKind::Static && !b.sensor).then_some(i)
-                }),
-            );
+        let sweep = self.settings.ccd && self.bodies.iter().any(|(_, b)| sweeps(b));
+        if !sweep {
+            for (_, body) in &mut self.bodies {
+                body.integrate_pose(h);
+            }
+            return;
         }
-        for i in 0..self.bodies.len() {
-            let mut remaining = h;
-            for _ in 0..4 {
-                let Some((distance, radius, speed, normal, j)) = self.first_impact(i, remaining)
-                else {
-                    self.bodies[i].1.integrate_pose(remaining);
-                    break;
-                };
-                let [(_, body), (_, target)] = self
-                    .bodies
-                    .get_disjoint_mut([i, j])
-                    .expect("distinct CCD bodies");
-                let time = distance / speed;
-                body.integrate_pose(time);
-                let contact = Contact {
-                    point: body.position - normal * radius,
-                    normal,
-                    depth: 0.0,
-                };
-                let mut row = make_row(
-                    target,
-                    body,
-                    contact,
-                    &[],
-                    &mut [false; 8],
-                    0.0,
-                    self.settings.bounce_threshold,
-                );
-                solve(target, body, &mut row);
-                // Separation keeps the next cast from immediately re-hitting
-                // the same surface because of roundoff.
-                body.position += normal * (radius * 1e-9);
-                stats.ccd_impacts += 1;
-                remaining -= time;
-                if remaining <= 0.0 {
-                    break;
+        let synchronized = self.settings.ccd_moving_spheres;
+        self.ccd_targets
+            .extend(self.bodies.iter().enumerate().filter_map(|(i, (_, b))| {
+                (!b.sensor
+                    && (b.kind == BodyKind::Static
+                        || (synchronized && matches!(b.shape, Shape::Sphere { .. }))))
+                .then_some(i)
+            }));
+        if synchronized {
+            self.advance_synchronized(h, start);
+        } else {
+            // Static targets make each dynamic sphere's cast independent.
+            for i in 0..self.bodies.len() {
+                let mut remaining = h;
+                for _ in 0..4 {
+                    let Some(hit) = self.first_impact(i, remaining, false) else {
+                        self.bodies[i].1.integrate_pose(remaining);
+                        break;
+                    };
+                    self.bodies[i].1.integrate_pose(hit.time);
+                    remaining = (remaining - hit.time).max(0.0);
+                    self.resolve_impact(hit, start + (h - remaining));
+                    if remaining == 0.0 {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    fn first_impact(&self, index: usize, dt: f64) -> Option<(f64, f64, f64, Vec3, usize)> {
-        let body = &self.bodies[index].1;
-        if self.ccd_targets.is_empty()
-            || !body.ccd
-            || body.sensor
-            || body.asleep
-            || body.kind != BodyKind::Dynamic
-        {
+    fn advance_synchronized(&mut self, h: f64, start: f64) {
+        let mut remaining = h;
+        for _ in 0..32 {
+            let next = (0..self.bodies.len())
+                .filter_map(|i| self.first_impact(i, remaining, true))
+                .min_by(|a, b| {
+                    a.time
+                        .total_cmp(&b.time)
+                        .then(self.bodies[a.moving].0.cmp(&self.bodies[b.moving].0))
+                        .then(self.bodies[a.target].0.cmp(&self.bodies[b.target].0))
+                });
+            let dt = next.as_ref().map_or(remaining, |hit| hit.time);
+            for (_, body) in &mut self.bodies {
+                body.integrate_pose(dt);
+            }
+            remaining = (remaining - dt).max(0.0);
+            let Some(hit) = next else {
+                break;
+            };
+            self.resolve_impact(hit, start + (h - remaining));
+            if remaining == 0.0 {
+                break;
+            }
+        }
+    }
+
+    fn first_impact(&self, index: usize, dt: f64, synchronized: bool) -> Option<ImpactCandidate> {
+        let (handle, body) = &self.bodies[index];
+        if !sweeps(body) {
             return None;
         }
         let Shape::Sphere { radius } = body.shape else {
-            return None;
+            unreachable!("validated moving sphere");
         };
-        let direction = body.velocity.try_normalize()?;
-        let speed = body.velocity.length();
-        let mut hit = None;
+        let mut best: Option<ImpactCandidate> = None;
         for &j in &self.ccd_targets {
-            let (handle, target) = &self.bodies[j];
-            if !compatible(body, target) {
+            let (other_handle, target) = &self.bodies[j];
+            if index == j
+                || !compatible(body, target)
+                || (synchronized && sweeps(target) && handle > other_handle)
+            {
                 continue;
             }
+            let relative = body.velocity - target.velocity;
+            let Some(direction) = relative.try_normalize() else {
+                continue;
+            };
+            let speed = relative.length();
             if let Some((distance, normal)) =
                 sweep_sphere(target, body.position, direction, radius, speed * dt)
-                && hit.is_none_or(|(best, id, _, _)| {
-                    distance < best || (distance == best && *handle < id)
-                })
             {
-                hit = Some((distance, *handle, normal, j));
+                let time = distance / speed;
+                if best.as_ref().is_none_or(|previous| {
+                    time < previous.time
+                        || (time == previous.time && *other_handle < self.bodies[previous.target].0)
+                }) {
+                    best = Some(ImpactCandidate {
+                        time,
+                        moving: index,
+                        target: j,
+                        radius,
+                        normal,
+                    });
+                }
             }
         }
-        hit.map(|(distance, _, normal, j)| (distance, radius, speed, normal, j))
+        best
     }
+
+    fn resolve_impact(&mut self, hit: ImpactCandidate, time: f64) {
+        let [(moving, a), (target, b)] = self
+            .bodies
+            .get_disjoint_mut([hit.moving, hit.target])
+            .expect("distinct CCD bodies");
+        if b.asleep {
+            b.wake();
+        }
+        let normal = hit.normal;
+        let contact = Contact {
+            point: a.position - normal * hit.radius,
+            normal,
+            depth: 0.0,
+        };
+        let mut row = make_row(
+            b,
+            a,
+            contact,
+            &[],
+            &mut [false; 8],
+            0.0,
+            self.settings.bounce_threshold,
+        );
+        solve(b, a, &mut row);
+        // Separate along the normal to avoid re-hitting the same contact due
+        // to roundoff. The lighter body moves farther.
+        let total = a.inverse_mass + b.inverse_mass;
+        let nudge = normal * (hit.radius * 1e-9);
+        a.position += nudge * (a.inverse_mass / total);
+        b.position -= nudge * (b.inverse_mass / total);
+        self.impacts.push(CcdImpact {
+            moving: *moving,
+            target: *target,
+            point: contact.point,
+            normal,
+            time,
+        });
+    }
+}
+
+fn sweeps(body: &RigidBody) -> bool {
+    body.ccd
+        && !body.sensor
+        && !body.asleep
+        && body.kind == BodyKind::Dynamic
+        && matches!(body.shape, Shape::Sphere { .. })
 }
 
 fn compatible(a: &RigidBody, b: &RigidBody) -> bool {

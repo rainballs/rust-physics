@@ -120,3 +120,43 @@ fn cylinder_box_uses_support_map_and_parallel_cylinders_resolve() {
     assert!((output[0].depth - 1.0).abs() < 1e-12);
     assert!(output[0].normal.is_normalized());
 }
+
+#[test]
+fn rigid_tetrahedron_centroid_inertia_and_surface_queries() {
+    use rust_physics::hull::RigidHull;
+    use rust_physics::{PhysicsWorld, QueryFilter};
+    use std::sync::Arc;
+    let vertices = vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z];
+    let faces = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
+    let mut reversed = faces.clone();
+    reversed[0].swap(1, 2);
+    assert!(RigidHull::new(vertices.clone(), reversed).is_none());
+    assert!(RigidHull::new(vertices.clone(), faces[..3].to_vec()).is_none());
+    let hull = Arc::new(RigidHull::new(vertices, faces).unwrap());
+    assert!(hull.input_center().distance(Vec3::splat(0.25)) < 1e-12);
+    let mut w = PhysicsWorld::new();
+    let id = w.add_body(
+        RigidBodyBuilder::dynamic()
+            .shape(Shape::Hull(hull))
+            .mass(2.0)
+            .build(),
+    );
+    let b = w.body(id).unwrap();
+    let tensor = b.world_inverse_inertia().inverse();
+    assert!((tensor.x_axis.x - 0.15).abs() < 1e-12);
+    assert!((tensor.x_axis.y - 0.025).abs() < 1e-12);
+    let hit = w
+        .raycast(Vec3::ZERO, -Vec3::X, 1.0, QueryFilter::default())
+        .unwrap();
+    assert!((hit.distance - 0.25).abs() < 1e-12);
+    assert_eq!(hit.normal, -Vec3::X);
+    let surface = w
+        .nearest_surface(Vec3::ZERO, QueryFilter::default())
+        .unwrap();
+    assert!(surface.distance < 0.0 && surface.distance > -0.25);
+    assert_eq!(
+        w.overlap_sphere(Vec3::ZERO, 0.01, QueryFilter::default())
+            .collect::<Vec<_>>(),
+        [id]
+    );
+}

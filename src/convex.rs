@@ -75,7 +75,11 @@ pub struct PrimitiveSupport<'a>(&'a RigidBody);
 
 impl<'a> PrimitiveSupport<'a> {
     pub fn new(body: &'a RigidBody) -> Option<Self> {
-        (body.shape() != Shape::Plane).then_some(Self(body))
+        (!matches!(
+            body.shape(),
+            Shape::Plane | Shape::Mesh(_) | Shape::Compound(_)
+        ))
+        .then_some(Self(body))
     }
 }
 
@@ -83,7 +87,7 @@ impl SupportMap for PrimitiveSupport<'_> {
     fn support(&self, direction: Vec3) -> Vec3 {
         let b = self.0;
         let d = b.rotation().conjugate() * direction;
-        let p = match b.shape() {
+        let p = match b.shape {
             Shape::Sphere { radius } => d * radius,
             Shape::Capsule {
                 radius,
@@ -97,7 +101,16 @@ impl SupportMap for PrimitiveSupport<'_> {
                 let radial = Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
                 radial * radius + Vec3::Y * (d.y.signum() * half_height)
             }
-            Shape::Plane => unreachable!("validated finite collider"),
+            Shape::Hull(ref hull) => hull
+                .surface()
+                .vertices()
+                .iter()
+                .copied()
+                .max_by(|a, b| a.dot(d).total_cmp(&b.dot(d)))
+                .expect("validated nonempty hull"),
+            Shape::Plane | Shape::Mesh(_) | Shape::Compound(_) => {
+                unreachable!("validated convex collider")
+            }
         };
         b.position() + b.rotation() * p
     }

@@ -1,6 +1,7 @@
 //! Narrow phase for spheres, capsules, oriented boxes, and infinite half-spaces.
 use crate::convex::{self, ConvexContact, PrimitiveSupport};
 use crate::spatial::{Aabb, box_intervals, project};
+use crate::terrain::{TriangleMesh, closest_triangle, triangle_normal};
 use crate::{RigidBody, Shape, Vec3};
 
 /// A world-space contact. The normal points in the direction that separates
@@ -15,9 +16,46 @@ pub struct Contact {
 /// Emits the current overlap manifold into a caller-owned vector.
 pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
     let start = out.len();
-    match (a.shape, b.shape) {
+    match (&a.shape, &b.shape) {
+        (Shape::Compound(compound), _) => compound_contacts(a, compound, b, out),
+        (_, Shape::Compound(compound)) => {
+            compound_contacts(b, compound, a, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Mesh(mesh), Shape::Sphere { radius }) => mesh_sphere(a, mesh, b, *radius, out),
+        (Shape::Sphere { radius }, Shape::Mesh(mesh)) => {
+            mesh_sphere(b, mesh, a, *radius, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Mesh(mesh), Shape::Cuboid { half_extents }) => {
+            mesh_box(a, mesh, b, *half_extents, out);
+        }
+        (Shape::Cuboid { half_extents }, Shape::Mesh(mesh)) => {
+            mesh_box(b, mesh, a, *half_extents, out);
+            flip(&mut out[start..]);
+        }
+        (
+            Shape::Mesh(mesh),
+            Shape::Capsule {
+                radius,
+                half_segment,
+            },
+        ) => {
+            mesh_capsule(a, mesh, b, *radius, *half_segment, out);
+        }
+        (
+            Shape::Capsule {
+                radius,
+                half_segment,
+            },
+            Shape::Mesh(mesh),
+        ) => {
+            mesh_capsule(b, mesh, a, *radius, *half_segment, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Mesh(_), _) | (_, Shape::Mesh(_)) => {}
         (Shape::Sphere { radius: ar }, Shape::Sphere { radius: br }) => {
-            rounded_points(a.position, b.position, ar, br, Vec3::X, out);
+            rounded_points(a.position, b.position, *ar, *br, Vec3::X, out);
         }
         (Shape::Plane, Shape::Plane) => {}
         (Shape::Plane, _) => plane_shape(a, b, out),
@@ -26,10 +64,10 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
             flip(&mut out[start..]);
         }
         (Shape::Cuboid { .. }, Shape::Sphere { radius }) => {
-            shape_sphere(a, b, radius, out);
+            shape_sphere(a, b, *radius, out);
         }
         (Shape::Sphere { radius }, Shape::Cuboid { .. }) => {
-            shape_sphere(b, a, radius, out);
+            shape_sphere(b, a, *radius, out);
             flip(&mut out[start..]);
         }
         (
@@ -51,23 +89,29 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
                 v * (2.0 * bh),
             );
             let normal = u.cross(v).try_normalize().unwrap_or(a.rotation * Vec3::X);
-            rounded_points(p, q, ar, br, normal, out);
+            rounded_points(p, q, *ar, *br, normal, out);
         }
-        (Shape::Capsule { .. }, Shape::Sphere { radius }) => capsule_sphere(a, b, radius, out),
+        (Shape::Capsule { .. }, Shape::Sphere { radius }) => capsule_sphere(a, b, *radius, out),
         (Shape::Sphere { radius }, Shape::Capsule { .. }) => {
-            capsule_sphere(b, a, radius, out);
+            capsule_sphere(b, a, *radius, out);
             flip(&mut out[start..]);
         }
         (Shape::Cuboid { half_extents }, Shape::Capsule { .. }) => {
-            box_capsule(a, half_extents, b, out)
+            box_capsule(a, *half_extents, b, out)
         }
         (Shape::Capsule { .. }, Shape::Cuboid { half_extents }) => {
-            box_capsule(b, half_extents, a, out);
+            box_capsule(b, *half_extents, a, out);
             flip(&mut out[start..]);
         }
-        (Shape::Cylinder { .. }, Shape::Sphere { radius }) => shape_sphere(a, b, radius, out),
+        (Shape::Hull(_), Shape::Sphere { radius }) => shape_sphere(a, b, *radius, out),
+        (Shape::Sphere { radius }, Shape::Hull(_)) => {
+            shape_sphere(b, a, *radius, out);
+            flip(&mut out[start..]);
+        }
+        (Shape::Hull(_), _) | (_, Shape::Hull(_)) => convex_pair(a, b, out),
+        (Shape::Cylinder { .. }, Shape::Sphere { radius }) => shape_sphere(a, b, *radius, out),
         (Shape::Sphere { radius }, Shape::Cylinder { .. }) => {
-            shape_sphere(b, a, radius, out);
+            shape_sphere(b, a, *radius, out);
             flip(&mut out[start..]);
         }
         (
@@ -82,14 +126,14 @@ pub fn contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
         ) => {
             let axis = a.rotation * Vec3::Y;
             if axis.cross(b.rotation * Vec3::Y).length_squared() < 1e-20 {
-                parallel_cylinders(a.position, b.position, axis, [ar, br], [ah, bh], out);
+                parallel_cylinders(a.position, b.position, axis, [*ar, *br], [*ah, *bh], out);
             } else {
                 convex_pair(a, b, out);
             }
         }
         (Shape::Cylinder { .. }, _) | (_, Shape::Cylinder { .. }) => convex_pair(a, b, out),
         (Shape::Cuboid { half_extents: ah }, Shape::Cuboid { half_extents: bh }) => {
-            box_box(Obb::new(a, ah), Obb::new(b, bh), out);
+            box_box(Obb::new(a, *ah), Obb::new(b, *bh), out);
         }
     }
 }
@@ -101,6 +145,7 @@ fn flip(contacts: &mut [Contact]) {
 }
 
 fn plane_shape(plane: &RigidBody, body: &RigidBody, out: &mut Vec<Contact>) {
+    let start = out.len();
     let normal = plane.rotation * Vec3::Y;
     let mut add = |point: Vec3| {
         let depth = (plane.position - point).dot(normal);
@@ -152,8 +197,262 @@ fn plane_shape(plane: &RigidBody, body: &RigidBody, out: &mut Vec<Contact>) {
                 add(point + cap);
             }
         }
-        Shape::Plane => {}
+        Shape::Hull(ref hull) => {
+            for &vertex in hull.surface().vertices() {
+                add(body.position + body.rotation * vertex);
+            }
+            reduce_contacts(out, start);
+        }
+        Shape::Plane | Shape::Mesh(_) | Shape::Compound(_) => {}
     }
+}
+
+fn compound_contacts(
+    a: &RigidBody,
+    compound: &crate::compound::Compound,
+    b: &RigidBody,
+    out: &mut Vec<Contact>,
+) {
+    let start = out.len();
+    let bounds = Aabb::of(b);
+    for part in compound.parts() {
+        let child = a.collider_part(part);
+        if bounds.is_none_or(|other| Aabb::of(&child).is_some_and(|local| local.intersects(other)))
+        {
+            contacts(&child, b, out);
+        }
+    }
+    reduce_contacts(out, start);
+}
+
+fn reduce_contacts(out: &mut Vec<Contact>, start: usize) {
+    // Contact caching has a fixed eight-point budget. Prefer deeper and
+    // distinct witnesses, with stable child order for ties.
+    if out.len() - start > 8 {
+        out[start..].sort_by(|a, b| b.depth.total_cmp(&a.depth));
+    }
+    let mut count = start;
+    for i in start..out.len() {
+        let contact = out[i];
+        if !out[start..count].iter().any(|existing| {
+            existing.normal.dot(contact.normal) > 1.0 - 1e-8
+                && existing.point.distance_squared(contact.point) < 1e-14
+        }) {
+            out[count] = contact;
+            count += 1;
+            if count == start + 8 {
+                break;
+            }
+        }
+    }
+    out.truncate(count);
+}
+
+fn mesh_sphere(
+    terrain: &RigidBody,
+    mesh: &TriangleMesh,
+    sphere: &RigidBody,
+    radius: f64,
+    out: &mut Vec<Contact>,
+) {
+    let center = terrain.rotation.conjugate() * (sphere.position - terrain.position);
+    let mut best = None;
+    mesh.sphere_contacts(center, radius, |point, normal, depth| {
+        if best.is_none_or(|(_, _, deepest)| depth > deepest) {
+            best = Some((point, normal, depth));
+        }
+    });
+    if let Some((point, normal, depth)) = best {
+        out.push(Contact {
+            point: terrain.position + terrain.rotation * (point - normal * depth * 0.5),
+            normal: terrain.rotation * normal,
+            depth,
+        });
+    }
+}
+
+fn mesh_box(
+    terrain: &RigidBody,
+    mesh: &TriangleMesh,
+    cube: &RigidBody,
+    h: Vec3,
+    out: &mut Vec<Contact>,
+) {
+    let inverse = terrain.rotation.conjugate();
+    let center = inverse * (cube.position - terrain.position);
+    let orientation = inverse * cube.rotation;
+    let extent = (orientation * Vec3::X).abs() * h.x
+        + (orientation * Vec3::Y).abs() * h.y
+        + (orientation * Vec3::Z).abs() * h.z;
+    let local = orientation.conjugate();
+    let mut patch: Vec<Vec3> = Vec::new();
+    let mut deepest = (f64::NEG_INFINITY, Vec3::Y);
+    let tolerance = h.max_element() * 1e-7;
+    mesh.visit_triangles(
+        Aabb {
+            min: center - extent,
+            max: center + extent,
+        },
+        |triangle| {
+            let triangle = triangle.map(|p| local * (p - center));
+            let Some((depth, normal)) = triangle_box_axis(triangle, h) else {
+                return;
+            };
+            if depth > deepest.0 + tolerance {
+                if normal.dot(deepest.1) < 1.0 - 1e-8 {
+                    patch.clear();
+                }
+                deepest = (depth, normal);
+            }
+            if normal.dot(deepest.1) >= 1.0 - 1e-8 && depth >= deepest.0 - tolerance {
+                clipped_triangle(triangle, h, &mut patch);
+            }
+        },
+    );
+    if patch.is_empty() {
+        return;
+    }
+    let (depth, n) = deepest;
+    let (u, v) = n.any_orthonormal_pair();
+    let mut chosen = [Vec3::ZERO; 4];
+    let mut count = 0;
+    for direction in [u + v, u - v, -u + v, -u - v] {
+        let point = *patch
+            .iter()
+            .max_by(|a, b| a.dot(direction).total_cmp(&b.dot(direction)))
+            .unwrap();
+        if chosen[..count]
+            .iter()
+            .any(|p| p.distance_squared(point) <= tolerance * tolerance)
+        {
+            continue;
+        }
+        chosen[count] = point;
+        count += 1;
+        out.push(Contact {
+            point: cube.position + cube.rotation * (point - n * depth * 0.5),
+            normal: cube.rotation * n,
+            depth,
+        });
+    }
+}
+
+fn triangle_box_axis(triangle @ [a, b, c]: [Vec3; 3], h: Vec3) -> Option<(f64, Vec3)> {
+    let edges = [b - a, c - b, a - c];
+    let mut best = (f64::INFINITY, Vec3::Y);
+    let triangle_normal = triangle_normal(triangle);
+    let axes =
+        std::iter::once(triangle_normal)
+            .chain(Vec3::AXES)
+            .chain(edges.into_iter().flat_map(|edge| {
+                let direction = edge.normalize();
+                Vec3::AXES.map(|axis| axis.cross(direction))
+            }));
+    for axis in axes {
+        if axis.length_squared() < 1e-16 {
+            continue;
+        }
+        let n = axis.normalize();
+        let projection = Vec3::from_array(triangle.map(|p| p.dot(n)));
+        let radius = h.dot(n.abs());
+        let forward = projection.max_element() + radius;
+        let backward = radius - projection.min_element();
+        if forward < 0.0 || backward < 0.0 {
+            return None;
+        }
+        let (depth, normal) = if forward <= backward {
+            (forward, n)
+        } else {
+            (backward, -n)
+        };
+        if depth < best.0 - 1e-10 * h.max_element() {
+            best = (depth, normal);
+        }
+    }
+    Some(best)
+}
+
+fn clipped_triangle(triangle: [Vec3; 3], h: Vec3, out: &mut Vec<Vec3>) {
+    let mut polygon = [Vec3::ZERO; 9];
+    let mut scratch = [Vec3::ZERO; 9];
+    polygon[..3].copy_from_slice(&triangle);
+    let mut count = 3;
+    for axis in 0..3 {
+        for sign in [-1.0, 1.0] {
+            count = clip_polygon(&polygon[..count], &mut scratch, |p| {
+                p[axis] * sign - h[axis]
+            });
+            if count == 0 {
+                return;
+            }
+            std::mem::swap(&mut polygon, &mut scratch);
+        }
+    }
+    out.extend_from_slice(&polygon[..count]);
+}
+
+fn mesh_capsule(
+    terrain: &RigidBody,
+    mesh: &TriangleMesh,
+    capsule: &RigidBody,
+    radius: f64,
+    h: f64,
+    out: &mut Vec<Contact>,
+) {
+    let inverse = terrain.rotation.conjugate();
+    let center = inverse * (capsule.position - terrain.position);
+    let axis = inverse * (capsule.rotation * Vec3::Y);
+    let [a, b] = [center - axis * h, center + axis * h];
+    let bounds = Aabb {
+        min: a.min(b),
+        max: a.max(b),
+    }
+    .expanded(radius);
+    let mut best = None;
+    mesh.visit_triangles(bounds, |tri| {
+        let (on_segment, on_triangle) = segment_triangle(a, b, tri);
+        let delta = on_segment - on_triangle;
+        let distance = delta.length();
+        let depth = radius - distance;
+        if depth < 0.0 || best.is_some_and(|(d, _, _)| d >= depth) {
+            return;
+        }
+        let normal = delta.try_normalize().unwrap_or_else(|| {
+            let n = triangle_normal(tri);
+            n * (center - tri[0]).dot(n).signum()
+        });
+        best = Some((depth, normal, on_triangle));
+    });
+    if let Some((depth, normal, point)) = best {
+        out.push(Contact {
+            point: terrain.position + terrain.rotation * (point - normal * depth * 0.5),
+            normal: terrain.rotation * normal,
+            depth,
+        });
+    }
+}
+
+fn segment_triangle(a: Vec3, b: Vec3, triangle @ [x, y, z]: [Vec3; 3]) -> (Vec3, Vec3) {
+    let segment = b - a;
+    let normal = triangle_normal(triangle);
+    let denominator = normal.dot(segment);
+    if denominator != 0.0 {
+        let t = (x - a).dot(normal) / denominator;
+        if (0.0..=1.0).contains(&t) {
+            let point = a + segment * t;
+            let nearest = closest_triangle(point, triangle);
+            if point.distance_squared(nearest) <= 1e-20 * segment.length_squared() {
+                return (point, point);
+            }
+        }
+    }
+    let edge_pairs = [(x, y), (y, z), (z, x)].map(|(p, q)| closest_segments(a, segment, p, q - p));
+    [a, b]
+        .map(|p| (p, closest_triangle(p, triangle)))
+        .into_iter()
+        .chain(edge_pairs)
+        .min_by(|(a, b), (c, d)| a.distance_squared(*b).total_cmp(&c.distance_squared(*d)))
+        .expect("candidate segment endpoints and triangle edges")
 }
 
 fn parallel_cylinders(
@@ -516,23 +815,7 @@ fn clip_faces(
             }
             let plane_normal = reference.axes[side] * sign;
             let distance = |p: Vec3| (p - reference.center).dot(plane_normal) - reference.h[side];
-            let mut previous = polygon[count - 1];
-            let mut last = distance(previous);
-            let mut written = 0;
-            for &point in &polygon[..count] {
-                let next = distance(point);
-                if (last < 0.0 && next > 0.0) || (last > 0.0 && next < 0.0) {
-                    scratch[written] = previous.lerp(point, last / (last - next));
-                    written += 1;
-                }
-                if next <= 0.0 {
-                    scratch[written] = point;
-                    written += 1;
-                }
-                previous = point;
-                last = next;
-            }
-            count = written;
+            count = clip_polygon(&polygon[..count], &mut scratch, distance);
             std::mem::swap(&mut polygon, &mut scratch);
         }
     }
@@ -546,4 +829,24 @@ fn clip_faces(
             });
         }
     }
+}
+
+fn clip_polygon(polygon: &[Vec3], scratch: &mut [Vec3], distance: impl Fn(Vec3) -> f64) -> usize {
+    let mut previous = polygon[polygon.len() - 1];
+    let mut last = distance(previous);
+    let mut written = 0;
+    for &point in polygon {
+        let next = distance(point);
+        if (last < 0.0 && next > 0.0) || (last > 0.0 && next < 0.0) {
+            scratch[written] = previous.lerp(point, last / (last - next));
+            written += 1;
+        }
+        if next <= 0.0 {
+            scratch[written] = point;
+            written += 1;
+        }
+        previous = point;
+        last = next;
+    }
+    written
 }

@@ -1,5 +1,9 @@
 //! Single-collider rigid bodies with a center of mass at the collider origin.
+use crate::compound::{ColliderPart, Compound};
+use crate::hull::RigidHull;
+use crate::terrain::TriangleMesh;
 use crate::{Mat3, Quat, Vec3};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
@@ -10,12 +14,15 @@ pub enum BodyKind {
 
 /// Local geometry centered on the body origin. A plane bounds the solid half-space
 /// below its local +Y normal.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Sphere { radius: f64 },
     Cuboid { half_extents: Vec3 },
     Capsule { radius: f64, half_segment: f64 },
     Cylinder { radius: f64, half_height: f64 },
+    Mesh(Arc<TriangleMesh>),
+    Hull(Arc<RigidHull>),
+    Compound(Arc<Compound>),
     Plane,
 }
 
@@ -44,8 +51,8 @@ impl Shape {
         }
     }
 
-    fn valid(self) -> bool {
-        match self {
+    pub(crate) fn valid(&self) -> bool {
+        match *self {
             Self::Sphere { radius } => radius.is_finite() && radius > 0.0,
             Self::Cuboid { half_extents } => {
                 half_extents.is_finite() && half_extents.min_element() > 0.0
@@ -63,12 +70,12 @@ impl Shape {
                 radius,
                 half_height,
             } => radius.is_finite() && radius > 0.0 && half_height.is_finite() && half_height > 0.0,
-            Self::Plane => true,
+            Self::Hull(_) | Self::Compound(_) | Self::Mesh(_) | Self::Plane => true,
         }
     }
 
-    fn inertia(self, mass: f64) -> Vec3 {
-        match self {
+    pub(crate) fn inertia(&self, mass: f64) -> Mat3 {
+        let diagonal = match *self {
             Self::Sphere { radius } => Vec3::splat(0.4 * mass * radius * radius),
             Self::Cuboid { half_extents: h } => {
                 let sq = h * h;
@@ -93,8 +100,11 @@ impl Shape {
                 let transverse = mass * (r * r / 4.0 + h * h / 3.0);
                 Vec3::new(transverse, 0.5 * mass * r * r, transverse)
             }
-            Self::Plane => Vec3::ZERO,
-        }
+            Self::Hull(ref hull) => return hull.inertia(mass),
+            Self::Compound(ref compound) => return compound.inertia(mass),
+            Self::Mesh(_) | Self::Plane => Vec3::ZERO,
+        };
+        Mat3::from_diagonal(diagonal)
     }
 }
 
@@ -131,7 +141,8 @@ pub struct RigidBody {
     pub(crate) force: Vec3,
     pub(crate) torque: Vec3,
     pub(crate) inverse_mass: f64,
-    pub(crate) inverse_inertia: Vec3,
+    inertia: Mat3,
+    pub(crate) inverse_inertia: Mat3,
     pub(crate) material: Material,
     pub(crate) damping: [f64; 2],
     pub(crate) gravity_scale: f64,
@@ -147,8 +158,8 @@ impl RigidBody {
     pub fn kind(&self) -> BodyKind {
         self.kind
     }
-    pub fn shape(&self) -> Shape {
-        self.shape
+    pub fn shape(&self) -> &Shape {
+        &self.shape
     }
     pub fn position(&self) -> Vec3 {
         self.position
@@ -186,7 +197,7 @@ impl RigidBody {
 
     pub fn world_inverse_inertia(&self) -> Mat3 {
         let r = Mat3::from_quat(self.rotation);
-        r * Mat3::from_diagonal(self.inverse_inertia) * r.transpose()
+        r * self.inverse_inertia * r.transpose()
     }
 
     pub(crate) fn apply_inverse_inertia(&self, v: Vec3) -> Vec3 {
@@ -214,7 +225,7 @@ impl RigidBody {
             BodyKind::Kinematic => self.kinematic_spin = velocity,
             BodyKind::Dynamic => {
                 let local = self.rotation.conjugate() * velocity;
-                self.angular_momentum = self.rotation * (local / self.inverse_inertia);
+                self.angular_momentum = self.rotation * (self.inertia * local);
             }
         }
         self.wake();
@@ -256,6 +267,16 @@ impl RigidBody {
 
     pub(crate) fn point_velocity(&self, offset: Vec3) -> Vec3 {
         self.velocity + self.angular_velocity().cross(offset)
+    }
+
+    /// Geometry-only child transform for contact and query dispatch.
+    pub(crate) fn collider_part(&self, part: &ColliderPart) -> Self {
+        Self {
+            shape: part.shape.clone(),
+            position: self.position + self.rotation * part.position,
+            rotation: self.rotation * part.rotation,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn integrate_pose(&mut self, dt: f64) {
@@ -306,7 +327,8 @@ impl RigidBodyBuilder {
                 force: Vec3::ZERO,
                 torque: Vec3::ZERO,
                 inverse_mass: 0.0,
-                inverse_inertia: Vec3::ZERO,
+                inertia: Mat3::ZERO,
+                inverse_inertia: Mat3::ZERO,
                 material: Material::default(),
                 damping: [0.0, 0.0],
                 gravity_scale: 1.0,
@@ -387,7 +409,8 @@ impl RigidBodyBuilder {
         let mut b = self.body;
         let m = b.material;
         let rotation_length = b.rotation.length();
-        if !b.shape.valid()
+        if (matches!(b.shape, Shape::Mesh(_)) && b.kind != BodyKind::Static)
+            || !b.shape.valid()
             || !b.position.is_finite()
             || !b.velocity.is_finite()
             || !self.spin.is_finite()
@@ -404,17 +427,27 @@ impl RigidBodyBuilder {
         }
         b.rotation /= rotation_length;
         if b.kind == BodyKind::Dynamic {
-            let inverse_inertia = b.shape.inertia(self.mass).recip();
+            let inertia = b.shape.inertia(self.mass);
+            let scale = inertia.x_axis.x.max(inertia.y_axis.y).max(inertia.z_axis.z);
             if !self.mass.is_finite()
                 || self.mass <= 0.0
                 || !self.mass.recip().is_finite()
-                || !inverse_inertia.is_finite()
-                || inverse_inertia.min_element() <= 0.0
+                || !inertia.is_finite()
+                || scale <= 0.0
             {
                 return Err(InvalidBody);
             }
+            let normalized = inertia * scale.recip();
+            if normalized.determinant() <= 0.0 {
+                return Err(InvalidBody);
+            }
+            let inverse = normalized.inverse() * scale.recip();
+            if !inverse.is_finite() {
+                return Err(InvalidBody);
+            }
             b.inverse_mass = self.mass.recip();
-            b.inverse_inertia = inverse_inertia;
+            b.inertia = inertia;
+            b.inverse_inertia = inverse;
         } else if b.kind == BodyKind::Static {
             b.velocity = Vec3::ZERO;
         }

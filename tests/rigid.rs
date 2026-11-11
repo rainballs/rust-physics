@@ -239,3 +239,48 @@ fn friction_holds_a_box_on_a_shallow_slope_and_slows_sliding() {
     let b = w.body(b).unwrap();
     assert!(b.velocity().dot(q * -Vec3::X) < 2.8);
 }
+
+#[test]
+fn synchronized_ccd_resolves_moving_spheres_at_relative_toi() {
+    for enabled in [true, false] {
+        let mut w = PhysicsWorld::new();
+        w.set_settings(rust_physics::Settings {
+            gravity: Vec3::ZERO,
+            ccd_moving_spheres: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        let material = Material {
+            restitution: 1.0,
+            ..Default::default()
+        };
+        let a = w.add_body(
+            RigidBodyBuilder::dynamic()
+                .position(-Vec3::X * 3.0)
+                .velocity(Vec3::X * 600.0)
+                .material(material)
+                .ccd(true)
+                .build(),
+        );
+        let b = w.add_body(
+            RigidBodyBuilder::dynamic()
+                .position(Vec3::X * 3.0)
+                .velocity(-Vec3::X * 400.0)
+                .material(material)
+                .build(),
+        );
+        let stats = w.step_fixed().unwrap();
+        if enabled {
+            assert_eq!(stats.ccd_impacts, 1);
+            let hit = w.ccd_impacts()[0];
+            assert_eq!((hit.moving, hit.target), (a, b));
+            assert!((hit.time - 0.005).abs() < 1e-12);
+            assert_eq!(hit.normal, -Vec3::X);
+            assert!(w.body(a).unwrap().velocity().distance(-Vec3::X * 400.0) < 1e-9);
+            assert!(w.body(b).unwrap().velocity().distance(Vec3::X * 600.0) < 1e-9);
+        } else {
+            assert_eq!(stats.ccd_impacts, 0);
+            assert!(w.body(a).unwrap().position().x > w.body(b).unwrap().position().x);
+        }
+    }
+}

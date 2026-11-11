@@ -1,6 +1,6 @@
 # Development checkpoint
 
-The library, examples, and benchmark targets are in the Cargo workspace root. The architecture and current API are described in the README and ARCHITECTURE. The initial rigid-body commit is `20f5e74`, followed by experimental particle-based simulation in `03a2e17`.
+The library, examples, and benchmark targets are in the Cargo workspace root. The architecture and current API are described in the README and ARCHITECTURE. The initial rigid-body commit is `20f5e74`. Particle-based simulation was added in `03a2e17`, and the first sandbox and BVH milestone is `72c5813`.
 
 ## Verification
 
@@ -20,6 +20,6 @@ The smoke command opens an OpenGL window, advances each sandbox scene, draws a f
 
 ## Active priorities
 
-Validate rounded-shape degeneracies and analytical integration errors, profile contact hot paths, and expand convex geometry. The rigid body model currently binds one collider to each center of mass. Rigid stepping and contact generation are serial. CCD is translational for dynamic spheres against static bodies and limits impacts to four per substep. The rigid solver clears its external force accumulator after the public step. The particle and soft-body solvers support discrete one-way boundary projection.
+Expand mesh and mixed convex coverage, profile contact hot paths, and improve fluid boundaries. The rigid body model supports weighted primitive and hull compounds. Rigid stepping and contact generation are serial. CCD is translational for dynamic spheres. The default static-target path allows four impacts per sphere per substep, and synchronized moving-sphere mode allows 32 world impacts per substep. The rigid solver clears its external force accumulator after the public step. The particle and soft-body solvers support discrete one-way boundary projection.
 
 See ROADMAP for unfinished work and PERFORMANCE for measured workloads and limitations.

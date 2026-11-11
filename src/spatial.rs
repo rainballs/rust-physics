@@ -31,12 +31,27 @@ impl Aabb {
                 u.abs() * half_height
                     + Vec3::from_array((v * v + w * w).to_array().map(f64::sqrt)) * radius
             }
+            Shape::Hull(ref hull) => return Some(hull.surface().bounds().transformed(body)),
+            Shape::Mesh(ref mesh) => return Some(mesh.bounds().transformed(body)),
+            Shape::Compound(ref shape) => return Some(shape.bounds().transformed(body)),
             Shape::Plane => return None,
         };
         Some(Self {
             min: body.position - extent,
             max: body.position + extent,
         })
+    }
+
+    fn transformed(self, body: &RigidBody) -> Self {
+        let center = body.position + body.rotation * self.center();
+        let h = (self.max - self.min) * 0.5;
+        let extent = (body.rotation * Vec3::X).abs() * h.x
+            + (body.rotation * Vec3::Y).abs() * h.y
+            + (body.rotation * Vec3::Z).abs() * h.z;
+        Self {
+            min: center - extent,
+            max: center + extent,
+        }
     }
 
     pub fn intersects(self, other: Self) -> bool {
@@ -74,6 +89,21 @@ pub(crate) fn ray_body(body: &RigidBody, origin: Vec3, direction: Vec3) -> Optio
             let inverse = body.rotation.conjugate();
             let (t, n) =
                 ray_cylinder(inverse * relative, inverse * direction, radius, half_height)?;
+            Some((t, body.rotation * n))
+        }
+        Shape::Compound(ref shape) => shape
+            .parts()
+            .iter()
+            .filter_map(|part| ray_body(&body.collider_part(part), origin, direction))
+            .min_by(|a, b| a.0.total_cmp(&b.0)),
+        Shape::Hull(ref hull) => {
+            let inverse = body.rotation.conjugate();
+            let (t, n) = hull.ray(inverse * relative, inverse * direction)?;
+            Some((t, body.rotation * n))
+        }
+        Shape::Mesh(ref mesh) => {
+            let inverse = body.rotation.conjugate();
+            let (t, n) = mesh.ray(inverse * relative, inverse * direction)?;
             Some((t, body.rotation * n))
         }
         Shape::Plane => {
@@ -165,6 +195,20 @@ pub(crate) fn project(body: &RigidBody, point: Vec3) -> (Vec3, Vec3, f64) {
             let normal = body.rotation * normal;
             (point - distance * normal, normal, distance)
         }
+        Shape::Compound(ref shape) => shape
+            .parts()
+            .iter()
+            .map(|part| project(&body.collider_part(part), point))
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .expect("validated nonempty compound"),
+        Shape::Hull(ref hull) => {
+            let (p, n, d) = hull.project(body.rotation.conjugate() * offset);
+            (body.position + body.rotation * p, body.rotation * n, d)
+        }
+        Shape::Mesh(ref mesh) => {
+            let (p, n, d) = mesh.project(body.rotation.conjugate() * offset);
+            (body.position + body.rotation * p, body.rotation * n, d)
+        }
         Shape::Plane => {
             let normal = body.rotation * Vec3::Y;
             let distance = offset.dot(normal);
@@ -236,8 +280,29 @@ pub(crate) fn sweep_sphere(
             }
             (t, normal)
         }
-        Shape::Cylinder { .. } => {
+        Shape::Cylinder { .. } | Shape::Hull(_) => {
             return conservative_sphere_cast(body, origin, direction, radius, max_distance);
+        }
+        Shape::Compound(ref shape) => {
+            return shape
+                .parts()
+                .iter()
+                .filter_map(|part| {
+                    sweep_sphere(
+                        &body.collider_part(part),
+                        origin,
+                        direction,
+                        radius,
+                        max_distance,
+                    )
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        Shape::Mesh(ref mesh) => {
+            let inverse = body.rotation.conjugate();
+            let (t, n) =
+                mesh.cast_sphere(inverse * offset, inverse * direction, radius, max_distance)?;
+            (t, body.rotation * n)
         }
         Shape::Cuboid { half_extents } => {
             let inverse = body.rotation.conjugate();
@@ -325,7 +390,7 @@ fn conservative_sphere_cast(
     None
 }
 
-fn ray_capsule(o: Vec3, d: Vec3, radius: f64, h: f64) -> Option<(f64, Vec3)> {
+pub(crate) fn ray_capsule(o: Vec3, d: Vec3, radius: f64, h: f64) -> Option<(f64, Vec3)> {
     let mut best: Option<(f64, Vec3)> = None;
     let mut consider = |offset: Vec3, direction: Vec3, valid: &dyn Fn(f64) -> bool| {
         let Some(roots) = sphere_roots(offset, direction, radius) else {
@@ -430,16 +495,18 @@ fn rounded_box(
 
 /// Flat median-split bounding volume hierarchy. Leaves refer to dense indices
 /// owned by the caller.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Bvh {
     nodes: Vec<Node>,
 }
 
+#[derive(Debug)]
 struct Node {
     bounds: Aabb,
     kind: NodeKind,
 }
 
+#[derive(Debug)]
 enum NodeKind {
     Leaf(usize),
     Branch { right: usize },
@@ -456,14 +523,26 @@ impl Aabb {
         self.min * 0.5 + self.max * 0.5
     }
 
-    fn union(self, other: Self) -> Self {
+    pub(crate) fn union(self, other: Self) -> Self {
         Self {
             min: self.min.min(other.min),
             max: self.max.max(other.max),
         }
     }
 
-    fn hit_ray(self, origin: Vec3, direction: Vec3, mut far: f64) -> bool {
+    pub(crate) fn expanded(self, radius: f64) -> Self {
+        let extent = Vec3::splat(radius);
+        Self {
+            min: self.min - extent,
+            max: self.max + extent,
+        }
+    }
+
+    fn distance_squared(self, point: Vec3) -> f64 {
+        point.distance_squared(point.clamp(self.min, self.max))
+    }
+
+    pub(crate) fn hit_ray(self, origin: Vec3, direction: Vec3, mut far: f64) -> bool {
         let mut near: f64 = 0.0;
         for axis in 0..3 {
             if direction[axis] == 0.0 {
@@ -533,6 +612,57 @@ impl Bvh {
     ) {
         if !self.nodes.is_empty() {
             self.visit_node(0, &mut intersects, &mut visit_leaf);
+        }
+    }
+
+    pub fn nearest<T>(
+        &self,
+        point: Vec3,
+        mut evaluate: impl FnMut(usize) -> (f64, T),
+    ) -> Option<(f64, usize, T)> {
+        let mut best = None;
+        if !self.nodes.is_empty() {
+            self.nearest_node(0, point, &mut evaluate, &mut best);
+        }
+        best
+    }
+
+    fn nearest_node<T>(
+        &self,
+        i: usize,
+        point: Vec3,
+        evaluate: &mut impl FnMut(usize) -> (f64, T),
+        best: &mut Option<(f64, usize, T)>,
+    ) {
+        let node = &self.nodes[i];
+        if best
+            .as_ref()
+            .is_some_and(|(d, _, _)| *d < node.bounds.distance_squared(point))
+        {
+            return;
+        }
+        match node.kind {
+            NodeKind::Leaf(index) => {
+                let (distance, value) = evaluate(index);
+                if best
+                    .as_ref()
+                    .is_none_or(|(d, j, _)| distance < *d || (distance == *d && index < *j))
+                {
+                    *best = Some((distance, index, value));
+                }
+            }
+            NodeKind::Branch { right } => {
+                let left = i + 1;
+                let dl = self.nodes[left].bounds.distance_squared(point);
+                let dr = self.nodes[right].bounds.distance_squared(point);
+                let [first, second] = if dl <= dr {
+                    [left, right]
+                } else {
+                    [right, left]
+                };
+                self.nearest_node(first, point, evaluate, best);
+                self.nearest_node(second, point, evaluate, best);
+            }
         }
     }
 

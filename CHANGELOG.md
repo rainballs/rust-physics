@@ -6,5 +6,7 @@
 - Added analytical primitive collisions, experimental GJK/EPA and convex hull queries, clipped box manifolds, cached contact impulses, friction, restitution, and island sleeping.
 - Added swept sphere impacts, ray and shape queries, and optional median BVH broad phase.
 - Added ball, fixed, distance, rope, spring, hinge, and prismatic constraints.
+- Added weighted compound colliders, solid convex hulls, static meshes, and heightfields.
+- Added synchronized moving-sphere CCD, a sphere character controller, and raycast suspension.
 - Added XPBD cloth, volume preservation, particles, optional parallel updates, and an experimental SPH solver.
 - Added a headless drop example, a graphical sandbox, regression tests, and release benchmark targets.

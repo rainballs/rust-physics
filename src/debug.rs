@@ -63,12 +63,13 @@ pub fn lines(world: &PhysicsWorld, options: DebugOptions, mut emit: impl FnMut(L
             } else {
                 LineKind::Collider
             };
-            wireframe(b, options.plane_extent, |a, b| line(a, b, kind));
+            wireframe(b, options.plane_extent, &mut |a, b| line(a, b, kind));
         }
         if options.bounds
             && let Some(aabb) = Aabb::of(b)
         {
             box_edges((aabb.max - aabb.min) * 0.5, |a, b| {
+                let center = (aabb.max + aabb.min) * 0.5;
                 line(center + a, center + b, LineKind::Bounds);
             });
         }
@@ -108,14 +109,14 @@ pub fn lines(world: &PhysicsWorld, options: DebugOptions, mut emit: impl FnMut(L
     }
 }
 
-fn wireframe(b: &RigidBody, plane_extent: f64, mut line: impl FnMut(Vec3, Vec3)) {
+fn wireframe(b: &RigidBody, plane_extent: f64, line: &mut dyn FnMut(Vec3, Vec3)) {
     let mut local = |p, q| {
         line(
             b.position() + b.rotation() * p,
             b.position() + b.rotation() * q,
         )
     };
-    match b.shape() {
+    match b.shape {
         Shape::Sphere { radius } => {
             for (u, v) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
                 arc(
@@ -175,6 +176,13 @@ fn wireframe(b: &RigidBody, plane_extent: f64, mut line: impl FnMut(Vec3, Vec3))
                 );
             }
         }
+        Shape::Compound(ref shape) => {
+            for part in shape.parts() {
+                wireframe(&b.collider_part(part), plane_extent, line);
+            }
+        }
+        Shape::Mesh(ref mesh) => mesh_wireframe(mesh, local),
+        Shape::Hull(ref hull) => mesh_wireframe(hull.surface(), local),
         Shape::Plane => {
             let e = plane_extent;
             for i in -8..=8 {
@@ -183,6 +191,15 @@ fn wireframe(b: &RigidBody, plane_extent: f64, mut line: impl FnMut(Vec3, Vec3))
                 local(Vec3::new(s, 0.0, -e), Vec3::new(s, 0.0, e));
             }
         }
+    }
+}
+
+fn mesh_wireframe(mesh: &crate::terrain::TriangleMesh, mut line: impl FnMut(Vec3, Vec3)) {
+    for &[a, b, c] in mesh.triangles() {
+        let [a, b, c] = [a, b, c].map(|i| mesh.vertices()[i]);
+        line(a, b);
+        line(b, c);
+        line(c, a);
     }
 }
 

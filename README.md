@@ -38,14 +38,15 @@ assert!(world.body(ball).unwrap().position().y >= 0.498);
 ```
 
 - Rigid bodies support static, kinematic, and dynamic motion, force and torque accumulation, world-space angular momentum, point impulses, gravity scaling, damping, and contact-island sleeping.
-- Spheres, capsules, cylinders, oriented cuboids, and half-spaces use shape-specific narrow-phase collision and experimental GJK/EPA for mixed cylinder pairs. Contact response includes restitution, two-regime friction, cached impulses, and separate penetration correction. Layers, masks, and sensors control collision and overlap behavior.
+- Primitive colliders include spheres, capsules, cylinders, cuboids, and half-spaces. The engine also supports weighted compounds, convex hulls from closed triangle surfaces, and static triangle meshes and heightfields. Mixed convex contacts can use experimental GJK/EPA. Contact response includes restitution, two-regime friction, cached impulses, and separate penetration correction. Layers, masks, and sensors control collision and overlap behavior.
 - Joint types include ball, distance, rope, damped spring, fixed, hinge, and slider. Hinges and sliders support effort-limited motors and limits.
 - Spatial queries include rays, batches, AABBs, sphere overlaps and casts, and nearest surfaces. Build a borrowed BVH with `world.spatial_index()` to accelerate repeated rays and AABB queries.
 - `softbody` implements XPBD cloth and tetrahedral volume constraints. `particles` implements seeded emitters, lifetimes, fields, optional Rayon updates, and rigid boundaries. `fluid` implements experimental weakly compressible SPH with symmetric pair forces and a spatial hash.
+- `character` implements sweep-and-slide sphere motion. `vehicle` applies raycast suspension and load-limited tire forces.
 - `debug` streams renderer-independent lines. The sandbox renders ten scenes including stacks, a pendulum, a jointed ragdoll, cloth, particles, and a fluid tank.
 
 ## Current limits
 
-The rigid world uses one centered collider per body. Convex hulls support standalone GJK/EPA queries. Cylinder pairs that depend on EPA may miss poorly conditioned contacts. CCD sweeps dynamic spheres against static geometry. Kinematic and dynamic pairs otherwise use discrete contacts. Capsule pairs usually produce one contact, and the box solver uses translation-only penetration correction. Very stiff joints, extreme mass ratios, dense stacks, and extreme coordinate or timestep scales need further validation. Rigid solving is serial. Soft and fluid boundary coupling is one-way and discrete, and cloth has no self-collision. Meshes, terrain, and compound colliders remain on the roadmap.
+Convex pairs that depend on EPA may miss poorly conditioned contacts. Static meshes currently contact spheres, capsules, cuboids, and compounds with supported children. CCD sweeps dynamic spheres against static geometry, with optional synchronized sweeps against moving spheres. Other moving shape pairs use discrete contacts. Capsule pairs usually produce one contact, and the box solver uses translation-only penetration correction. Very stiff joints, extreme mass ratios, dense stacks, and extreme coordinate or timestep scales need further validation. Rigid solving is serial. Soft and fluid boundary coupling is one-way and discrete, and cloth has no self-collision.
 
 See [architecture](ARCHITECTURE.md), [physics theory](PHYSICS_THEORY.md), [performance](PERFORMANCE.md), [roadmap](ROADMAP.md), and the [development checkpoint](DEVELOPMENT_STATE.md).
