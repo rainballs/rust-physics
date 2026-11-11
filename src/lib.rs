@@ -3,8 +3,12 @@
 
 pub mod body;
 pub mod collision;
+pub mod fluid;
+pub mod grid;
 pub mod integrators;
 pub mod joints;
+pub mod particles;
+pub mod softbody;
 pub mod spatial;
 pub mod world;
 
